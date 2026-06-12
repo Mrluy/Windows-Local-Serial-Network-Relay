@@ -25,16 +25,18 @@ from serial.tools import list_ports
 
 APP_NAME = "本地串口网络透传工具"
 APP_DIR_NAME = "SerialTcpRelay"
+APP_ICON_PATH = Path("img") / "app.png"
 SERIAL_READ_SIZE = 4096
 TCP_READ_SIZE = 4096
 
 
-PASS_THROUGH_MODES = {
-    "双向透传": "bidirectional",
-    "仅网络到串口": "tcp_to_serial",
-    "仅串口到网络": "serial_to_tcp",
+NETWORK_MODES = {
+    "TCP Server": "tcp_server",
+    "TCP Client": "tcp_client",
+    "UDP Server": "udp_server",
+    "UDP Client": "udp_client",
 }
-PASS_THROUGH_MODE_LABELS = {value: key for key, value in PASS_THROUGH_MODES.items()}
+NETWORK_MODE_LABELS = {value: key for key, value in NETWORK_MODES.items()}
 
 CLIENT_POLICIES = {
     "仅允许一个客户端": "single",
@@ -65,9 +67,11 @@ class SerialSettings:
 @dataclass(frozen=True)
 class RelaySettings:
     serial: SerialSettings
+    network_mode: str
     bind_host: str
-    tcp_port: int
-    pass_through_mode: str
+    local_port: int
+    remote_host: str
+    remote_port: int
     client_policy: str
     access_mode: str
     access_rules: tuple[str, ...]
@@ -76,16 +80,18 @@ class RelaySettings:
 
 @dataclass(eq=False)
 class ClientSession:
-    conn: socket.socket
     peer_ip: str
     peer_port: int
+    protocol: str
     connected_at: float
-    tcp_to_serial_bytes: int = 0
-    serial_to_tcp_bytes: int = 0
+    conn: socket.socket | None = None
+    udp_addr: tuple[str, int] | None = None
+    network_to_serial_bytes: int = 0
+    serial_to_network_bytes: int = 0
 
     @property
     def peer(self) -> str:
-        return f"{self.peer_ip}:{self.peer_port}"
+        return f"{self.protocol} {self.peer_ip}:{self.peer_port}"
 
 
 class AccessControl:
@@ -225,11 +231,11 @@ class SerialTcpRelay:
 
     @property
     def _tcp_to_serial_enabled(self) -> bool:
-        return self.settings.pass_through_mode in {"bidirectional", "tcp_to_serial"}
+        return True
 
     @property
     def _serial_to_tcp_enabled(self) -> bool:
-        return self.settings.pass_through_mode in {"bidirectional", "serial_to_tcp"}
+        return True
 
     def _open_serial(self, settings: SerialSettings) -> serial.Serial:
         bytesize = {
@@ -442,14 +448,465 @@ class SerialTcpRelay:
             self._unregister_client(conn, "服务停止")
 
 
+class SerialNetworkRelay:
+    def __init__(self, settings: RelaySettings, emit: Callable[[str, dict[str, Any]], None]) -> None:
+        self.settings = settings
+        self.emit = emit
+
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._network_socket: socket.socket | None = None
+        self._udp_socket: socket.socket | None = None
+        self._serial: serial.Serial | None = None
+        self._serial_reader_started = False
+        self._serial_write_lock = threading.Lock()
+        self._clients_lock = threading.Lock()
+        self._clients: dict[Any, ClientSession] = {}
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._run, name="relay-main", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        self._close_network_socket()
+        self._close_all_clients()
+        self._close_serial()
+
+    def _run(self) -> None:
+        access = AccessControl(self.settings.access_mode, self.settings.access_rules)
+        if access.invalid_rules:
+            self._log("WARN", f"已忽略无效黑白名单规则: {', '.join(access.invalid_rules)}")
+
+        try:
+            self._serial = self._open_serial(self.settings.serial)
+            self._log("INFO", f"已打开串口 {self._serial_label()}")
+
+            if self.settings.network_mode == "tcp_server":
+                self._run_tcp_server(access)
+            elif self.settings.network_mode == "tcp_client":
+                self._run_tcp_client(access)
+            elif self.settings.network_mode == "udp_server":
+                self._run_udp_server(access)
+            elif self.settings.network_mode == "udp_client":
+                self._run_udp_client(access)
+            else:
+                raise ValueError(f"未知网络模式: {self.settings.network_mode}")
+        except Exception as exc:
+            if not self._stop_event.is_set():
+                self._log("ERROR", f"运行失败: {exc}")
+                self._emit_status(False, f"运行失败: {exc}")
+        finally:
+            self.stop()
+            self._emit_status(False, "已停止")
+            self._log("INFO", "服务已停止")
+
+    def _run_tcp_server(self, access: AccessControl) -> None:
+        server = socket.create_server((self.settings.bind_host, self.settings.local_port), reuse_port=False)
+        self._network_socket = server
+        server.listen(16)
+        server.settimeout(0.5)
+
+        self._log("INFO", f"TCP Server 正在监听 {self.settings.bind_host}:{self.settings.local_port}")
+        self._emit_status(True, "运行中")
+        self._start_serial_reader()
+
+        while not self._stop_event.is_set():
+            try:
+                conn, addr = server.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                if not self._stop_event.is_set():
+                    raise
+                break
+
+            peer_ip, peer_port = addr[0], addr[1]
+            peer = f"TCP {peer_ip}:{peer_port}"
+            if not access.allows(peer_ip):
+                self._record(peer, "已拒绝", "命中访问控制")
+                self._log("WARN", f"已拒绝对端 {peer}")
+                safe_close(conn)
+                continue
+
+            key = self._register_tcp_client(conn, peer_ip, peer_port)
+            if key is None:
+                self._record(peer, "已拒绝", "当前只允许一个对端")
+                self._log("WARN", f"已拒绝对端 {peer}: 当前只允许一个对端")
+                safe_close(conn)
+                continue
+
+            threading.Thread(
+                target=self._tcp_to_serial_loop,
+                args=(key, conn),
+                name=f"tcp-client-{peer_ip}:{peer_port}",
+                daemon=True,
+            ).start()
+
+    def _run_tcp_client(self, access: AccessControl) -> None:
+        remote = resolve_ipv4_endpoint(self.settings.remote_host, self.settings.remote_port, socket.SOCK_STREAM)
+        if not access.allows(remote[0]):
+            raise PermissionError(f"目标地址 {remote[0]} 被访问控制拒绝")
+
+        conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        if self.settings.bind_host != "0.0.0.0" or self.settings.local_port > 0:
+            conn.bind((self.settings.bind_host, self.settings.local_port))
+        conn.settimeout(8)
+        conn.connect(remote)
+        conn.settimeout(0.5)
+        self._network_socket = conn
+
+        key = self._register_tcp_client(conn, remote[0], remote[1])
+        if key is None:
+            safe_close(conn)
+            raise RuntimeError("无法注册 TCP 连接")
+
+        self._log("INFO", f"TCP Client 已连接 {remote[0]}:{remote[1]}")
+        self._emit_status(True, "运行中")
+        self._start_serial_reader()
+        self._tcp_to_serial_loop(key, conn)
+
+    def _run_udp_server(self, access: AccessControl) -> None:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.bind((self.settings.bind_host, self.settings.local_port))
+        sock.settimeout(0.5)
+        self._network_socket = sock
+        self._udp_socket = sock
+
+        self._log("INFO", f"UDP Server 正在监听 {self.settings.bind_host}:{self.settings.local_port}")
+        self._emit_status(True, "运行中")
+        self._start_serial_reader()
+
+        while not self._stop_event.is_set():
+            try:
+                data, addr = sock.recvfrom(TCP_READ_SIZE)
+            except socket.timeout:
+                continue
+            except OSError:
+                if not self._stop_event.is_set():
+                    raise
+                break
+
+            peer_ip, peer_port = addr[0], addr[1]
+            peer = f"UDP {peer_ip}:{peer_port}"
+            if not access.allows(peer_ip):
+                self._record(peer, "已拒绝", "命中访问控制")
+                self._log("WARN", f"已拒绝对端 {peer}")
+                continue
+
+            session = self._register_udp_peer(addr)
+            if session is None:
+                self._record(peer, "已拒绝", "当前只允许一个对端")
+                self._log("WARN", f"已拒绝对端 {peer}: 当前只允许一个对端")
+                continue
+            self._write_serial_from_network(session, data)
+
+    def _run_udp_client(self, access: AccessControl) -> None:
+        remote = resolve_ipv4_endpoint(self.settings.remote_host, self.settings.remote_port, socket.SOCK_DGRAM)
+        if not access.allows(remote[0]):
+            raise PermissionError(f"目标地址 {remote[0]} 被访问控制拒绝")
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        if self.settings.bind_host != "0.0.0.0" or self.settings.local_port > 0:
+            sock.bind((self.settings.bind_host, self.settings.local_port))
+        sock.connect(remote)
+        sock.settimeout(0.5)
+        self._network_socket = sock
+        self._udp_socket = sock
+
+        session = self._register_udp_peer(remote)
+        if session is None:
+            safe_close(sock)
+            raise RuntimeError("无法注册 UDP 对端")
+
+        self._log("INFO", f"UDP Client 已连接 {remote[0]}:{remote[1]}")
+        self._emit_status(True, "运行中")
+        self._start_serial_reader()
+
+        while not self._stop_event.is_set():
+            try:
+                data = sock.recv(TCP_READ_SIZE)
+            except socket.timeout:
+                continue
+            except OSError:
+                if not self._stop_event.is_set():
+                    raise
+                break
+
+            if data:
+                self._write_serial_from_network(session, data)
+
+    def _start_serial_reader(self) -> None:
+        if self._serial_reader_started:
+            return
+        self._serial_reader_started = True
+        threading.Thread(target=self._serial_to_network_loop, name="serial-reader", daemon=True).start()
+
+    def _open_serial(self, settings: SerialSettings) -> serial.Serial:
+        bytesize = {
+            5: serial.FIVEBITS,
+            6: serial.SIXBITS,
+            7: serial.SEVENBITS,
+            8: serial.EIGHTBITS,
+        }[settings.data_bits]
+        parity = {
+            "N": serial.PARITY_NONE,
+            "E": serial.PARITY_EVEN,
+            "O": serial.PARITY_ODD,
+            "M": serial.PARITY_MARK,
+            "S": serial.PARITY_SPACE,
+        }[settings.parity]
+        stopbits = {
+            "1": serial.STOPBITS_ONE,
+            "1.5": serial.STOPBITS_ONE_POINT_FIVE,
+            "2": serial.STOPBITS_TWO,
+        }[settings.stop_bits]
+
+        port = serial.Serial(
+            port=settings.port,
+            baudrate=settings.baudrate,
+            bytesize=bytesize,
+            parity=parity,
+            stopbits=stopbits,
+            timeout=0.05,
+            write_timeout=3,
+            xonxoff=False,
+            rtscts=False,
+            dsrdtr=False,
+        )
+        port.dtr = settings.dtr
+        port.rts = settings.rts
+        if settings.reset_input:
+            port.reset_input_buffer()
+        return port
+
+    def _serial_label(self) -> str:
+        serial_settings = self.settings.serial
+        return (
+            f"{serial_settings.port} {serial_settings.baudrate}-"
+            f"{serial_settings.data_bits}{serial_settings.parity}{serial_settings.stop_bits}"
+        )
+
+    def _register_tcp_client(self, conn: socket.socket, peer_ip: str, peer_port: int) -> socket.socket | None:
+        with self._clients_lock:
+            if self.settings.client_policy == "single" and self._clients:
+                return None
+            session = ClientSession(
+                peer_ip=peer_ip,
+                peer_port=peer_port,
+                protocol="TCP",
+                connected_at=time.time(),
+                conn=conn,
+            )
+            self._clients[conn] = session
+
+        self._record(session.peer, "已连接", "")
+        self._log("INFO", f"对端已连接 {session.peer}")
+        self._emit_clients()
+        return conn
+
+    def _register_udp_peer(self, addr: tuple[str, int]) -> ClientSession | None:
+        key = ("UDP", addr[0], addr[1])
+        with self._clients_lock:
+            existing = self._clients.get(key)
+            if existing is not None:
+                return existing
+            if self.settings.client_policy == "single" and self._clients:
+                return None
+            session = ClientSession(
+                peer_ip=addr[0],
+                peer_port=addr[1],
+                protocol="UDP",
+                connected_at=time.time(),
+                udp_addr=addr,
+            )
+            self._clients[key] = session
+
+        self._record(session.peer, "已连接", "")
+        self._log("INFO", f"对端已连接 {session.peer}")
+        self._emit_clients()
+        return session
+
+    def _unregister_session(self, key: Any, reason: str) -> None:
+        with self._clients_lock:
+            session = self._clients.pop(key, None)
+
+        if session is None:
+            if isinstance(key, socket.socket):
+                safe_close(key)
+            return
+
+        if session.conn is not None:
+            safe_close(session.conn)
+        detail = (
+            f"{reason}; 网络->串口 {session.network_to_serial_bytes} B, "
+            f"串口->网络 {session.serial_to_network_bytes} B"
+        )
+        self._record(session.peer, "已断开", detail)
+        self._log("INFO", f"对端已断开 {session.peer}: {detail}")
+        self._emit_clients()
+
+    def _tcp_to_serial_loop(self, key: socket.socket, conn: socket.socket) -> None:
+        reason = "对端关闭"
+        while not self._stop_event.is_set():
+            try:
+                data = conn.recv(TCP_READ_SIZE)
+            except socket.timeout:
+                continue
+            except OSError as exc:
+                reason = str(exc)
+                break
+
+            if not data:
+                break
+
+            session = self._get_session(key)
+            if session is None:
+                break
+            if not self._write_serial_from_network(session, data):
+                reason = "写串口失败"
+                break
+
+        self._unregister_session(key, reason)
+        if self.settings.network_mode == "tcp_client":
+            self._stop_event.set()
+
+    def _write_serial_from_network(self, session: ClientSession, data: bytes) -> bool:
+        try:
+            with self._serial_write_lock:
+                if self._serial is None:
+                    raise serial.SerialException("serial port is closed")
+                self._serial.write(data)
+                self._serial.flush()
+        except (OSError, serial.SerialException) as exc:
+            self._log("ERROR", f"写串口失败: {exc}")
+            self._stop_event.set()
+            return False
+
+        session.network_to_serial_bytes += len(data)
+        self._traffic(session.peer, "网络->串口", len(data), data)
+        return True
+
+    def _serial_to_network_loop(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                if self._serial is None:
+                    break
+                data = self._serial.read(SERIAL_READ_SIZE)
+            except serial.SerialException as exc:
+                self._log("ERROR", f"读串口失败: {exc}")
+                self._stop_event.set()
+                break
+
+            if data:
+                self._broadcast(data)
+
+    def _broadcast(self, data: bytes) -> None:
+        with self._clients_lock:
+            items = list(self._clients.items())
+
+        dead: list[tuple[Any, str]] = []
+        for key, session in items:
+            try:
+                if session.conn is not None:
+                    session.conn.sendall(data)
+                elif session.udp_addr is not None and self._udp_socket is not None:
+                    if self.settings.network_mode == "udp_client":
+                        self._udp_socket.send(data)
+                    else:
+                        self._udp_socket.sendto(data, session.udp_addr)
+                else:
+                    continue
+            except OSError as exc:
+                dead.append((key, str(exc)))
+                continue
+
+            session.serial_to_network_bytes += len(data)
+            self._traffic(session.peer, "串口->网络", len(data), data)
+
+        for key, reason in dead:
+            self._unregister_session(key, reason)
+
+    def _get_session(self, key: Any) -> ClientSession | None:
+        with self._clients_lock:
+            return self._clients.get(key)
+
+    def _emit_clients(self) -> None:
+        with self._clients_lock:
+            clients = [
+                {
+                    "peer": session.peer,
+                    "connected_at": session.connected_at,
+                    "network_to_serial_bytes": session.network_to_serial_bytes,
+                    "serial_to_network_bytes": session.serial_to_network_bytes,
+                }
+                for session in self._clients.values()
+            ]
+        self.emit("clients", {"clients": clients})
+
+    def _record(self, peer: str, event: str, detail: str) -> None:
+        self.emit(
+            "record",
+            {
+                "time": dt.datetime.now().strftime("%H:%M:%S"),
+                "peer": peer,
+                "event": event,
+                "detail": detail,
+            },
+        )
+
+    def _traffic(self, peer: str, direction: str, byte_count: int, data: bytes) -> None:
+        payload: dict[str, Any] = {
+            "peer": peer,
+            "direction": direction,
+            "byte_count": byte_count,
+            "hex": data.hex(" ").upper(),
+        }
+        self.emit("traffic", payload)
+        self._emit_clients()
+
+    def _log(self, level: str, message: str) -> None:
+        self.emit(
+            "log",
+            {
+                "time": dt.datetime.now().strftime("%H:%M:%S"),
+                "level": level,
+                "message": message,
+            },
+        )
+
+    def _emit_status(self, running: bool, text: str) -> None:
+        self.emit("status", {"running": running, "text": text})
+
+    def _close_network_socket(self) -> None:
+        network_socket = self._network_socket
+        self._network_socket = None
+        self._udp_socket = None
+        if network_socket is not None:
+            safe_close(network_socket)
+
+    def _close_serial(self) -> None:
+        port = self._serial
+        self._serial = None
+        if port is not None:
+            safe_close(port)
+
+    def _close_all_clients(self) -> None:
+        with self._clients_lock:
+            keys = list(self._clients.keys())
+        for key in keys:
+            self._unregister_session(key, "服务停止")
+
+
 class SerialRelayApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title(APP_NAME)
+        self._set_window_icon()
         self.minsize(980, 680)
 
         self.event_queue: queue.Queue[tuple[str, dict[str, Any]]] = queue.Queue()
-        self.relay: SerialTcpRelay | None = None
+        self.relay: SerialNetworkRelay | None = None
         self.running = False
 
         self._build_variables()
@@ -457,8 +914,19 @@ class SerialRelayApp(tk.Tk):
         self._load_settings()
         self._refresh_ports()
         self._refresh_bind_hosts()
+        self._update_network_mode_state()
         self._poll_events()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _set_window_icon(self) -> None:
+        icon_path = resource_path(APP_ICON_PATH)
+        if not icon_path.exists():
+            return
+        try:
+            self._app_icon = tk.PhotoImage(file=str(icon_path))
+            self.iconphoto(True, self._app_icon)
+        except tk.TclError:
+            pass
 
     def _build_variables(self) -> None:
         self.serial_port_var = tk.StringVar()
@@ -470,9 +938,11 @@ class SerialRelayApp(tk.Tk):
         self.rts_var = tk.BooleanVar(value=True)
         self.reset_input_var = tk.BooleanVar(value=True)
 
+        self.network_mode_var = tk.StringVar(value=NETWORK_MODE_LABELS["tcp_server"])
         self.bind_host_var = tk.StringVar(value="0.0.0.0")
-        self.tcp_port_var = tk.StringVar(value="10123")
-        self.pass_through_mode_var = tk.StringVar(value=PASS_THROUGH_MODE_LABELS["bidirectional"])
+        self.local_port_var = tk.StringVar(value="10123")
+        self.remote_host_var = tk.StringVar(value="")
+        self.remote_port_var = tk.StringVar(value="10123")
         self.client_policy_var = tk.StringVar(value=CLIENT_POLICY_LABELS["single"])
         self.access_mode_var = tk.StringVar(value=ACCESS_MODE_LABELS["allow_all"])
         self.hex_log_var = tk.BooleanVar(value=False)
@@ -480,8 +950,11 @@ class SerialRelayApp(tk.Tk):
 
         self.status_var = tk.StringVar(value="已停止")
         self.address_hint_var = tk.StringVar(value="")
+        self.network_mode_var.trace_add("write", lambda *_: self._on_network_mode_changed())
         self.bind_host_var.trace_add("write", lambda *_: self._update_address_hint())
-        self.tcp_port_var.trace_add("write", lambda *_: self._update_address_hint())
+        self.local_port_var.trace_add("write", lambda *_: self._update_address_hint())
+        self.remote_host_var.trace_add("write", lambda *_: self._update_address_hint())
+        self.remote_port_var.trace_add("write", lambda *_: self._update_address_hint())
 
     def _build_ui(self) -> None:
         self.columnconfigure(0, weight=1)
@@ -560,32 +1033,43 @@ class SerialRelayApp(tk.Tk):
         frame = ttk.LabelFrame(parent, text="网络")
         frame.columnconfigure(1, weight=1)
 
-        ttk.Label(frame, text="绑定地址").grid(row=0, column=0, sticky="w", padx=8, pady=(8, 4))
+        ttk.Label(frame, text="网络模式").grid(row=0, column=0, sticky="w", padx=8, pady=(8, 4))
+        self.network_mode_combo = ttk.Combobox(
+            frame,
+            textvariable=self.network_mode_var,
+            values=tuple(NETWORK_MODES.keys()),
+            state="readonly",
+        )
+        self.network_mode_combo.grid(row=0, column=1, columnspan=2, sticky="ew", padx=(4, 8), pady=(8, 4))
+
+        ttk.Label(frame, text="绑定地址").grid(row=1, column=0, sticky="w", padx=8, pady=4)
         self.bind_combo = ttk.Combobox(frame, textvariable=self.bind_host_var, state="readonly")
-        self.bind_combo.grid(row=0, column=1, sticky="ew", padx=4, pady=(8, 4))
-        ttk.Button(frame, text="刷新", command=self._refresh_bind_hosts).grid(row=0, column=2, padx=(4, 8), pady=(8, 4))
+        self.bind_combo.grid(row=1, column=1, sticky="ew", padx=4, pady=4)
+        ttk.Button(frame, text="刷新", command=self._refresh_bind_hosts).grid(row=1, column=2, padx=(4, 8), pady=4)
 
-        ttk.Label(frame, text="TCP 端口").grid(row=1, column=0, sticky="w", padx=8, pady=4)
-        ttk.Entry(frame, textvariable=self.tcp_port_var).grid(row=1, column=1, columnspan=2, sticky="ew", padx=(4, 8), pady=4)
+        ttk.Label(frame, text="本地端口").grid(row=2, column=0, sticky="w", padx=8, pady=4)
+        self.local_port_entry = ttk.Entry(frame, textvariable=self.local_port_var)
+        self.local_port_entry.grid(row=2, column=1, columnspan=2, sticky="ew", padx=(4, 8), pady=4)
 
-        ttk.Label(frame, text="客户端").grid(row=2, column=0, sticky="w", padx=8, pady=4)
-        ttk.Combobox(
+        ttk.Label(frame, text="目标地址").grid(row=3, column=0, sticky="w", padx=8, pady=4)
+        self.remote_host_entry = ttk.Entry(frame, textvariable=self.remote_host_var)
+        self.remote_host_entry.grid(row=3, column=1, columnspan=2, sticky="ew", padx=(4, 8), pady=4)
+
+        ttk.Label(frame, text="目标端口").grid(row=4, column=0, sticky="w", padx=8, pady=4)
+        self.remote_port_entry = ttk.Entry(frame, textvariable=self.remote_port_var)
+        self.remote_port_entry.grid(row=4, column=1, columnspan=2, sticky="ew", padx=(4, 8), pady=4)
+
+        ttk.Label(frame, text="对端策略").grid(row=5, column=0, sticky="w", padx=8, pady=4)
+        self.client_policy_combo = ttk.Combobox(
             frame,
             textvariable=self.client_policy_var,
             values=tuple(CLIENT_POLICIES.keys()),
             state="readonly",
-        ).grid(row=2, column=1, columnspan=2, sticky="ew", padx=(4, 8), pady=4)
-
-        ttk.Label(frame, text="透传模式").grid(row=3, column=0, sticky="w", padx=8, pady=4)
-        ttk.Combobox(
-            frame,
-            textvariable=self.pass_through_mode_var,
-            values=tuple(PASS_THROUGH_MODES.keys()),
-            state="readonly",
-        ).grid(row=3, column=1, columnspan=2, sticky="ew", padx=(4, 8), pady=4)
+        )
+        self.client_policy_combo.grid(row=5, column=1, columnspan=2, sticky="ew", padx=(4, 8), pady=4)
 
         options = ttk.Frame(frame)
-        options.grid(row=4, column=0, columnspan=3, sticky="ew", padx=8, pady=(4, 8))
+        options.grid(row=6, column=0, columnspan=3, sticky="ew", padx=8, pady=(4, 8))
         ttk.Checkbutton(options, text="十六进制日志", variable=self.hex_log_var).grid(row=0, column=0, sticky="w")
         ttk.Checkbutton(options, text="日志自动滚动", variable=self.autoscroll_var).grid(row=0, column=1, sticky="w", padx=(12, 0))
         ttk.Button(options, text="复制地址", command=self._copy_address).grid(row=1, column=0, sticky="w", pady=(8, 0))
@@ -628,18 +1112,18 @@ class SerialRelayApp(tk.Tk):
         active_tab.rowconfigure(0, weight=1)
         self.clients_tree = ttk.Treeview(
             active_tab,
-            columns=("peer", "connected", "tcp_to_serial", "serial_to_tcp"),
+            columns=("peer", "connected", "network_to_serial", "serial_to_network"),
             show="headings",
             height=5,
         )
-        self.clients_tree.heading("peer", text="客户端")
+        self.clients_tree.heading("peer", text="对端")
         self.clients_tree.heading("connected", text="连接时间")
-        self.clients_tree.heading("tcp_to_serial", text="TCP->串口")
-        self.clients_tree.heading("serial_to_tcp", text="串口->TCP")
+        self.clients_tree.heading("network_to_serial", text="网络->串口")
+        self.clients_tree.heading("serial_to_network", text="串口->网络")
         self.clients_tree.column("peer", width=180, anchor="w")
         self.clients_tree.column("connected", width=120, anchor="w")
-        self.clients_tree.column("tcp_to_serial", width=110, anchor="e")
-        self.clients_tree.column("serial_to_tcp", width=110, anchor="e")
+        self.clients_tree.column("network_to_serial", width=110, anchor="e")
+        self.clients_tree.column("serial_to_network", width=110, anchor="e")
         self.clients_tree.grid(row=0, column=0, sticky="nsew")
         active_scroll = ttk.Scrollbar(active_tab, orient="vertical", command=self.clients_tree.yview)
         active_scroll.grid(row=0, column=1, sticky="ns")
@@ -656,7 +1140,7 @@ class SerialRelayApp(tk.Tk):
         )
         for column, title, width in (
             ("time", "时间", 80),
-            ("peer", "客户端", 180),
+            ("peer", "对端", 180),
             ("event", "事件", 90),
             ("detail", "详情", 420),
         ):
@@ -709,6 +1193,30 @@ class SerialRelayApp(tk.Tk):
         self.bind_host_var.set(current if current in values else values[0])
         self._update_address_hint()
 
+    def _on_network_mode_changed(self) -> None:
+        mode = self._network_mode_value()
+        if mode in {"tcp_client", "udp_client"} and self.local_port_var.get() == "10123":
+            self.local_port_var.set("0")
+        elif mode in {"tcp_server", "udp_server"} and self.local_port_var.get() == "0":
+            self.local_port_var.set(self.remote_port_var.get().strip() or "10123")
+        self._update_network_mode_state()
+
+    def _update_network_mode_state(self) -> None:
+        if not hasattr(self, "remote_host_entry"):
+            return
+
+        mode = self._network_mode_value()
+        remote_state = "normal" if mode in {"tcp_client", "udp_client"} else "disabled"
+        for widget in (self.remote_host_entry, self.remote_port_entry):
+            widget.configure(state=remote_state)
+
+        policy_state = "readonly" if mode in {"tcp_server", "udp_server"} else "disabled"
+        self.client_policy_combo.configure(state=policy_state)
+        self._update_address_hint()
+
+    def _network_mode_value(self) -> str:
+        return NETWORK_MODES.get(self.network_mode_var.get(), "tcp_server")
+
     def _copy_address(self) -> None:
         address = self._current_connect_address()
         self.clipboard_clear()
@@ -716,8 +1224,14 @@ class SerialRelayApp(tk.Tk):
         self._append_log("INFO", f"已复制连接地址: {address}")
 
     def _current_connect_address(self) -> str:
+        mode = self._network_mode_value()
+        if mode in {"tcp_client", "udp_client"}:
+            host = self.remote_host_var.get().strip() or "目标IP"
+            port = self.remote_port_var.get().strip()
+            return f"{host}:{port}"
+
         bind_host = self.bind_host_var.get()
-        port = self.tcp_port_var.get().strip()
+        port = self.local_port_var.get().strip()
         if bind_host == "0.0.0.0":
             addresses = list(detect_local_ipv4_addresses())
             host = addresses[0] if addresses else "本机IP"
@@ -726,7 +1240,9 @@ class SerialRelayApp(tk.Tk):
         return f"{host}:{port}"
 
     def _update_address_hint(self) -> None:
-        self.address_hint_var.set(f"连接地址: {self._current_connect_address()}")
+        mode = self._network_mode_value()
+        prefix = "目标地址" if mode in {"tcp_client", "udp_client"} else "监听地址"
+        self.address_hint_var.set(f"{prefix}: {self._current_connect_address()}")
 
     def _start(self) -> None:
         try:
@@ -738,7 +1254,7 @@ class SerialRelayApp(tk.Tk):
         self._save_settings()
         self._set_controls_running(True)
         self._append_log("INFO", "正在启动服务")
-        self.relay = SerialTcpRelay(settings, lambda kind, payload: self.event_queue.put((kind, payload)))
+        self.relay = SerialNetworkRelay(settings, lambda kind, payload: self.event_queue.put((kind, payload)))
         self.relay.start()
 
     def _stop(self) -> None:
@@ -753,12 +1269,21 @@ class SerialRelayApp(tk.Tk):
 
         try:
             baudrate = int(self.baudrate_var.get())
-            tcp_port = int(self.tcp_port_var.get())
+            local_port = int(self.local_port_var.get())
+            remote_port = int(self.remote_port_var.get())
         except ValueError as exc:
-            raise ValueError("波特率和 TCP 端口必须是数字。") from exc
+            raise ValueError("波特率、本地端口和目标端口必须是数字。") from exc
 
-        if not 1 <= tcp_port <= 65535:
-            raise ValueError("TCP 端口必须在 1 到 65535 之间。")
+        network_mode = self._network_mode_value()
+        if network_mode in {"tcp_server", "udp_server"} and not 1 <= local_port <= 65535:
+            raise ValueError("Server 模式的本地端口必须在 1 到 65535 之间。")
+        if network_mode in {"tcp_client", "udp_client"}:
+            if not self.remote_host_var.get().strip():
+                raise ValueError("Client 模式必须填写目标地址。")
+            if not 1 <= remote_port <= 65535:
+                raise ValueError("Client 模式的目标端口必须在 1 到 65535 之间。")
+        if not 0 <= local_port <= 65535:
+            raise ValueError("本地端口必须在 0 到 65535 之间。")
 
         serial_settings = SerialSettings(
             port=serial_port,
@@ -774,9 +1299,11 @@ class SerialRelayApp(tk.Tk):
         access_rules = tuple(split_rules(self.access_text.get("1.0", "end")))
         return RelaySettings(
             serial=serial_settings,
+            network_mode=network_mode,
             bind_host=self.bind_host_var.get(),
-            tcp_port=tcp_port,
-            pass_through_mode=PASS_THROUGH_MODES[self.pass_through_mode_var.get()],
+            local_port=local_port,
+            remote_host=self.remote_host_var.get().strip(),
+            remote_port=remote_port,
             client_policy=CLIENT_POLICIES[self.client_policy_var.get()],
             access_mode=ACCESS_MODES[self.access_mode_var.get()],
             access_rules=access_rules,
@@ -840,8 +1367,8 @@ class SerialRelayApp(tk.Tk):
                 values=(
                     client["peer"],
                     connected,
-                    format_bytes_count(client["tcp_to_serial_bytes"]),
-                    format_bytes_count(client["serial_to_tcp_bytes"]),
+                    format_bytes_count(client["network_to_serial_bytes"]),
+                    format_bytes_count(client["serial_to_network_bytes"]),
                 ),
             )
 
@@ -887,9 +1414,11 @@ class SerialRelayApp(tk.Tk):
             "dtr": self.dtr_var.get(),
             "rts": self.rts_var.get(),
             "reset_input": self.reset_input_var.get(),
+            "network_mode": self.network_mode_var.get(),
             "bind_host": self.bind_host_var.get(),
-            "tcp_port": self.tcp_port_var.get(),
-            "pass_through_mode": self.pass_through_mode_var.get(),
+            "local_port": self.local_port_var.get(),
+            "remote_host": self.remote_host_var.get(),
+            "remote_port": self.remote_port_var.get(),
             "client_policy": self.client_policy_var.get(),
             "access_mode": self.access_mode_var.get(),
             "access_rules": self.access_text.get("1.0", "end").strip(),
@@ -914,9 +1443,15 @@ class SerialRelayApp(tk.Tk):
         self.dtr_var.set(bool(data.get("dtr", self.dtr_var.get())))
         self.rts_var.set(bool(data.get("rts", self.rts_var.get())))
         self.reset_input_var.set(bool(data.get("reset_input", self.reset_input_var.get())))
+
+        network_mode = data.get("network_mode", self.network_mode_var.get())
+        if network_mode not in NETWORK_MODES:
+            network_mode = self.network_mode_var.get()
+        self.network_mode_var.set(network_mode)
         self.bind_host_var.set(data.get("bind_host", self.bind_host_var.get()))
-        self.tcp_port_var.set(data.get("tcp_port", self.tcp_port_var.get()))
-        self.pass_through_mode_var.set(data.get("pass_through_mode", self.pass_through_mode_var.get()))
+        self.local_port_var.set(data.get("local_port", data.get("tcp_port", self.local_port_var.get())))
+        self.remote_host_var.set(data.get("remote_host", self.remote_host_var.get()))
+        self.remote_port_var.set(data.get("remote_port", data.get("tcp_port", self.remote_port_var.get())))
         self.client_policy_var.set(data.get("client_policy", self.client_policy_var.get()))
         self.access_mode_var.set(data.get("access_mode", self.access_mode_var.get()))
         self.hex_log_var.set(bool(data.get("hex_log", self.hex_log_var.get())))
@@ -963,6 +1498,13 @@ def detect_local_ipv4_addresses() -> list[str]:
     return addresses
 
 
+def resolve_ipv4_endpoint(host: str, port: int, socktype: int) -> tuple[str, int]:
+    infos = socket.getaddrinfo(host, port, socket.AF_INET, socktype)
+    if not infos:
+        raise OSError(f"无法解析地址 {host}:{port}")
+    return infos[0][4]
+
+
 def split_rules(text: str) -> list[str]:
     rules: list[str] = []
     for line in text.replace(",", "\n").replace(";", "\n").splitlines():
@@ -978,6 +1520,13 @@ def settings_path() -> Path:
     if base:
         return Path(base) / APP_DIR_NAME / "settings.json"
     return Path.home() / f".{APP_DIR_NAME}" / "settings.json"
+
+
+def resource_path(relative_path: Path) -> Path:
+    base_path = getattr(sys, "_MEIPASS", None)
+    if base_path:
+        return Path(base_path) / relative_path
+    return Path(__file__).resolve().parent / relative_path
 
 
 def format_bytes_count(value: int) -> str:
