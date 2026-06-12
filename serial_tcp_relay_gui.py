@@ -26,6 +26,8 @@ from serial.tools import list_ports
 APP_NAME = "本地串口网络透传工具"
 APP_DIR_NAME = "SerialTcpRelay"
 APP_ICON_PATH = Path("img") / "app.png"
+BIND_ALL_VALUE = "0.0.0.0"
+BIND_ALL_LABEL = "允许所有"
 SERIAL_READ_SIZE = 4096
 TCP_READ_SIZE = 4096
 
@@ -549,7 +551,7 @@ class SerialNetworkRelay:
             raise PermissionError(f"目标地址 {remote[0]} 被访问控制拒绝")
 
         conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        if self.settings.bind_host != "0.0.0.0" or self.settings.local_port > 0:
+        if self.settings.bind_host != BIND_ALL_VALUE or self.settings.local_port > 0:
             conn.bind((self.settings.bind_host, self.settings.local_port))
         conn.settimeout(8)
         conn.connect(remote)
@@ -607,7 +609,7 @@ class SerialNetworkRelay:
             raise PermissionError(f"目标地址 {remote[0]} 被访问控制拒绝")
 
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        if self.settings.bind_host != "0.0.0.0" or self.settings.local_port > 0:
+        if self.settings.bind_host != BIND_ALL_VALUE or self.settings.local_port > 0:
             sock.bind((self.settings.bind_host, self.settings.local_port))
         sock.connect(remote)
         sock.settimeout(0.5)
@@ -939,7 +941,7 @@ class SerialRelayApp(tk.Tk):
         self.reset_input_var = tk.BooleanVar(value=True)
 
         self.network_mode_var = tk.StringVar(value=NETWORK_MODE_LABELS["tcp_server"])
-        self.bind_host_var = tk.StringVar(value="0.0.0.0")
+        self.bind_host_var = tk.StringVar(value=BIND_ALL_LABEL)
         self.local_port_var = tk.StringVar(value="10123")
         self.remote_host_var = tk.StringVar(value="")
         self.remote_port_var = tk.StringVar(value="10123")
@@ -1184,13 +1186,14 @@ class SerialRelayApp(tk.Tk):
             self.serial_port_var.set("")
 
     def _refresh_bind_hosts(self) -> None:
-        current = self.bind_host_var.get()
-        values = ["0.0.0.0", "127.0.0.1"]
+        current = bind_host_value(self.bind_host_var.get())
+        values = [BIND_ALL_LABEL, "127.0.0.1"]
         for ip in detect_local_ipv4_addresses():
             if ip not in values:
                 values.append(ip)
         self.bind_combo.configure(values=values)
-        self.bind_host_var.set(current if current in values else values[0])
+        current_display = bind_host_display(current)
+        self.bind_host_var.set(current_display if current_display in values else values[0])
         self._update_address_hint()
 
     def _on_network_mode_changed(self) -> None:
@@ -1230,11 +1233,10 @@ class SerialRelayApp(tk.Tk):
             port = self.remote_port_var.get().strip()
             return f"{host}:{port}"
 
-        bind_host = self.bind_host_var.get()
+        bind_host = bind_host_value(self.bind_host_var.get())
         port = self.local_port_var.get().strip()
-        if bind_host == "0.0.0.0":
-            addresses = list(detect_local_ipv4_addresses())
-            host = addresses[0] if addresses else "本机IP"
+        if bind_host == BIND_ALL_VALUE:
+            host = BIND_ALL_LABEL
         else:
             host = bind_host
         return f"{host}:{port}"
@@ -1300,7 +1302,7 @@ class SerialRelayApp(tk.Tk):
         return RelaySettings(
             serial=serial_settings,
             network_mode=network_mode,
-            bind_host=self.bind_host_var.get(),
+            bind_host=bind_host_value(self.bind_host_var.get()),
             local_port=local_port,
             remote_host=self.remote_host_var.get().strip(),
             remote_port=remote_port,
@@ -1415,7 +1417,7 @@ class SerialRelayApp(tk.Tk):
             "rts": self.rts_var.get(),
             "reset_input": self.reset_input_var.get(),
             "network_mode": self.network_mode_var.get(),
-            "bind_host": self.bind_host_var.get(),
+            "bind_host": bind_host_value(self.bind_host_var.get()),
             "local_port": self.local_port_var.get(),
             "remote_host": self.remote_host_var.get(),
             "remote_port": self.remote_port_var.get(),
@@ -1448,7 +1450,7 @@ class SerialRelayApp(tk.Tk):
         if network_mode not in NETWORK_MODES:
             network_mode = self.network_mode_var.get()
         self.network_mode_var.set(network_mode)
-        self.bind_host_var.set(data.get("bind_host", self.bind_host_var.get()))
+        self.bind_host_var.set(bind_host_display(data.get("bind_host", self.bind_host_var.get())))
         self.local_port_var.set(data.get("local_port", data.get("tcp_port", self.local_port_var.get())))
         self.remote_host_var.set(data.get("remote_host", self.remote_host_var.get()))
         self.remote_port_var.set(data.get("remote_port", data.get("tcp_port", self.remote_port_var.get())))
@@ -1503,6 +1505,14 @@ def resolve_ipv4_endpoint(host: str, port: int, socktype: int) -> tuple[str, int
     if not infos:
         raise OSError(f"无法解析地址 {host}:{port}")
     return infos[0][4]
+
+
+def bind_host_display(value: str) -> str:
+    return BIND_ALL_LABEL if value == BIND_ALL_VALUE else value
+
+
+def bind_host_value(display: str) -> str:
+    return BIND_ALL_VALUE if display in {BIND_ALL_LABEL, BIND_ALL_VALUE} else display
 
 
 def split_rules(text: str) -> list[str]:

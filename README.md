@@ -13,7 +13,7 @@ python .\serial_tcp_relay_gui.py
 GUI 支持：
 
 - 选择串口、波特率、数据位、校验位、停止位、DTR/RTS
-- 绑定任意地址 `0.0.0.0`、回环地址或检测到的本机 IPv4 地址
+- 绑定“允许所有”、回环地址或检测到的本机 IPv4 地址
 - 网络模式支持 `TCP Server`、`TCP Client`、`UDP Server`、`UDP Client`
 - 设置本地绑定地址、本地端口、目标地址和目标端口
 - Server 模式支持单对端或多对端策略
