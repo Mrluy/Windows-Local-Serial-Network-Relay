@@ -10,6 +10,7 @@ import json
 import os
 import queue
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -481,6 +482,7 @@ class SerialNetworkRelay:
             self._log("WARN", f"已忽略无效黑白名单规则: {', '.join(access.invalid_rules)}")
 
         try:
+            self._preflight_network_bind()
             self._serial = self._open_serial(self.settings.serial)
             self._log("INFO", f"已打开串口 {self._serial_label()}")
 
@@ -496,12 +498,21 @@ class SerialNetworkRelay:
                 raise ValueError(f"未知网络模式: {self.settings.network_mode}")
         except Exception as exc:
             if not self._stop_event.is_set():
-                self._log("ERROR", f"运行失败: {exc}")
-                self._emit_status(False, f"运行失败: {exc}")
+                message = format_runtime_error(exc, self.settings)
+                self._log("ERROR", message)
+                self._emit_status(False, message)
         finally:
             self.stop()
             self._emit_status(False, "已停止")
             self._log("INFO", "服务已停止")
+
+    def _preflight_network_bind(self) -> None:
+        if self.settings.network_mode == "tcp_server":
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.bind((self.settings.bind_host, self.settings.local_port))
+        elif self.settings.network_mode == "udp_server":
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+                sock.bind((self.settings.bind_host, self.settings.local_port))
 
     def _run_tcp_server(self, access: AccessControl) -> None:
         server = socket.create_server((self.settings.bind_host, self.settings.local_port), reuse_port=False)
@@ -1505,6 +1516,60 @@ def resolve_ipv4_endpoint(host: str, port: int, socktype: int) -> tuple[str, int
     if not infos:
         raise OSError(f"无法解析地址 {host}:{port}")
     return infos[0][4]
+
+
+def format_runtime_error(exc: Exception, settings: RelaySettings) -> str:
+    if isinstance(exc, OSError) and is_address_in_use(exc):
+        owner = find_port_owner(settings.local_port)
+        mode_label = NETWORK_MODE_LABELS.get(settings.network_mode, settings.network_mode)
+        bind_label = bind_host_display(settings.bind_host)
+        owner_text = f"当前占用进程: {owner}。" if owner else ""
+        return (
+            f"启动失败：{mode_label} 本地地址 {bind_label}:{settings.local_port} 已被占用。"
+            f"{owner_text}请关闭占用程序，或改用其它本地端口。"
+        )
+    return f"运行失败: {exc}"
+
+
+def is_address_in_use(exc: OSError) -> bool:
+    return getattr(exc, "winerror", None) == 10048 or getattr(exc, "errno", None) in {98, 10048}
+
+
+def find_port_owner(port: int) -> str:
+    if os.name != "nt" or not port:
+        return ""
+
+    script = f"""
+$portNumber = {port}
+$owners = @()
+$owners += Get-NetTCPConnection -LocalPort $portNumber -ErrorAction SilentlyContinue |
+    Select-Object -ExpandProperty OwningProcess
+$owners += Get-NetUDPEndpoint -LocalPort $portNumber -ErrorAction SilentlyContinue |
+    Select-Object -ExpandProperty OwningProcess
+$ownerPid = $owners | Where-Object {{ $_ }} | Select-Object -First 1
+if ($ownerPid) {{
+    $process = Get-Process -Id $ownerPid -ErrorAction SilentlyContinue
+    if ($process) {{
+        "$($process.ProcessName).exe (PID $ownerPid)"
+    }} else {{
+        "PID $ownerPid"
+    }}
+}}
+"""
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+    if result.returncode != 0:
+        return ""
+    return result.stdout.strip().splitlines()[0] if result.stdout.strip() else ""
 
 
 def bind_host_display(value: str) -> str:
