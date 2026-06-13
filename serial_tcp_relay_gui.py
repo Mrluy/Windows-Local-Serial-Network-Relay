@@ -65,6 +65,8 @@ class SerialSettings:
     dtr: bool
     rts: bool
     reset_input: bool
+    auto_reconnect: bool
+    reconnect_interval: float
 
 
 @dataclass(frozen=True)
@@ -439,8 +441,9 @@ class SerialTcpRelay:
             safe_close(server)
 
     def _close_serial(self) -> None:
-        port = self._serial
-        self._serial = None
+        with self._serial_write_lock:
+            port = self._serial
+            self._serial = None
         if port is not None:
             safe_close(port)
 
@@ -462,7 +465,10 @@ class SerialNetworkRelay:
         self._udp_socket: socket.socket | None = None
         self._serial: serial.Serial | None = None
         self._serial_reader_started = False
-        self._serial_write_lock = threading.Lock()
+        self._serial_write_lock = threading.RLock()
+        self._serial_reconnect_lock = threading.Lock()
+        self._serial_reconnect_thread: threading.Thread | None = None
+        self._last_serial_drop_log = 0.0
         self._clients_lock = threading.Lock()
         self._clients: dict[Any, ClientSession] = {}
 
@@ -483,8 +489,18 @@ class SerialNetworkRelay:
 
         try:
             self._preflight_network_bind()
-            self._serial = self._open_serial(self.settings.serial)
-            self._log("INFO", f"已打开串口 {self._serial_label()}")
+            try:
+                self._serial = self._open_serial(self.settings.serial)
+                self._log("INFO", f"已打开串口 {self._serial_label()}")
+            except (OSError, serial.SerialException) as exc:
+                if not self.settings.serial.auto_reconnect:
+                    raise
+                self._serial = None
+                self._log(
+                    "WARN",
+                    f"打开串口失败: {exc}。服务会继续运行，并每 {self.settings.serial.reconnect_interval:g} 秒尝试重连。",
+                )
+                self._start_serial_reconnect()
 
             if self.settings.network_mode == "tcp_server":
                 self._run_tcp_server(access)
@@ -785,16 +801,22 @@ class SerialNetworkRelay:
             self._stop_event.set()
 
     def _write_serial_from_network(self, session: ClientSession, data: bytes) -> bool:
+        if self._serial is None:
+            self._drop_serial_data(session, data, "串口离线")
+            self._start_serial_reconnect()
+            return True
+
         try:
             with self._serial_write_lock:
                 if self._serial is None:
-                    raise serial.SerialException("serial port is closed")
+                    self._drop_serial_data(session, data, "串口离线")
+                    self._start_serial_reconnect()
+                    return True
                 self._serial.write(data)
                 self._serial.flush()
         except (OSError, serial.SerialException) as exc:
-            self._log("ERROR", f"写串口失败: {exc}")
-            self._stop_event.set()
-            return False
+            self._drop_serial_data(session, data, f"写串口失败: {exc}")
+            return self._handle_serial_error("写串口失败", exc)
 
         session.network_to_serial_bytes += len(data)
         self._traffic(session.peer, "网络->串口", len(data), data)
@@ -802,17 +824,97 @@ class SerialNetworkRelay:
 
     def _serial_to_network_loop(self) -> None:
         while not self._stop_event.is_set():
+            if self._serial is None:
+                self._start_serial_reconnect()
+                self._stop_event.wait(0.2)
+                continue
+
             try:
                 if self._serial is None:
-                    break
+                    continue
                 data = self._serial.read(SERIAL_READ_SIZE)
-            except serial.SerialException as exc:
-                self._log("ERROR", f"读串口失败: {exc}")
-                self._stop_event.set()
-                break
+            except (OSError, serial.SerialException) as exc:
+                if not self._handle_serial_error("读串口失败", exc):
+                    break
+                continue
 
             if data:
                 self._broadcast(data)
+
+    def _drop_serial_data(self, session: ClientSession, data: bytes, reason: str) -> None:
+        now = time.monotonic()
+        if now - self._last_serial_drop_log >= 2:
+            self._last_serial_drop_log = now
+            self._log("WARN", f"{reason}，已丢弃来自 {session.peer} 的 {len(data)} B 网络数据。")
+
+    def _handle_serial_error(self, action: str, exc: Exception) -> bool:
+        if self._stop_event.is_set():
+            return False
+
+        if not self.settings.serial.auto_reconnect:
+            self._log("ERROR", f"{action}: {exc}")
+            self._stop_event.set()
+            return False
+
+        self._mark_serial_offline()
+        self._log(
+            "WARN",
+            f"{action}: {exc}。串口已离线，服务保持运行，并每 {self.settings.serial.reconnect_interval:g} 秒尝试重连。",
+        )
+        self._emit_status(True, "运行中（串口重连中）")
+        self._start_serial_reconnect()
+        return True
+
+    def _mark_serial_offline(self) -> None:
+        with self._serial_write_lock:
+            port = self._serial
+            self._serial = None
+        if port is not None:
+            safe_close(port)
+
+    def _start_serial_reconnect(self) -> None:
+        if not self.settings.serial.auto_reconnect or self._stop_event.is_set():
+            return
+
+        with self._serial_reconnect_lock:
+            if self._serial is not None:
+                return
+            if self._serial_reconnect_thread is not None and self._serial_reconnect_thread.is_alive():
+                return
+            self._serial_reconnect_thread = threading.Thread(
+                target=self._serial_reconnect_loop,
+                name="serial-reconnect",
+                daemon=True,
+            )
+            self._serial_reconnect_thread.start()
+
+    def _serial_reconnect_loop(self) -> None:
+        while not self._stop_event.is_set():
+            with self._serial_write_lock:
+                if self._serial is not None:
+                    return
+
+            try:
+                port = self._open_serial(self.settings.serial)
+            except (OSError, serial.SerialException) as exc:
+                self._log(
+                    "WARN",
+                    f"串口重连失败: {exc}。{self.settings.serial.reconnect_interval:g} 秒后重试。",
+                )
+                self._stop_event.wait(self.settings.serial.reconnect_interval)
+                continue
+
+            with self._serial_write_lock:
+                if self._serial is None:
+                    self._serial = port
+                    port = None
+            if port is not None:
+                safe_close(port)
+                return
+
+            self._log("INFO", f"串口已重新连接 {self._serial_label()}")
+            self._emit_status(True, "运行中")
+            return
 
     def _broadcast(self, data: bytes) -> None:
         with self._clients_lock:
@@ -950,6 +1052,8 @@ class SerialRelayApp(tk.Tk):
         self.dtr_var = tk.BooleanVar(value=True)
         self.rts_var = tk.BooleanVar(value=True)
         self.reset_input_var = tk.BooleanVar(value=True)
+        self.serial_auto_reconnect_var = tk.BooleanVar(value=True)
+        self.serial_reconnect_interval_var = tk.StringVar(value="2")
 
         self.network_mode_var = tk.StringVar(value=NETWORK_MODE_LABELS["tcp_server"])
         self.bind_host_var = tk.StringVar(value=BIND_ALL_LABEL)
@@ -1040,6 +1144,16 @@ class SerialRelayApp(tk.Tk):
         ttk.Checkbutton(checks, text="启动时清空串口缓冲", variable=self.reset_input_var).grid(
             row=1, column=0, columnspan=2, sticky="w", pady=(4, 0)
         )
+        ttk.Checkbutton(checks, text="串口断开自动重连", variable=self.serial_auto_reconnect_var).grid(
+            row=2, column=0, columnspan=2, sticky="w", pady=(4, 0)
+        )
+        ttk.Label(checks, text="重连间隔(秒)").grid(row=3, column=0, sticky="w", pady=(4, 0))
+        ttk.Combobox(
+            checks,
+            textvariable=self.serial_reconnect_interval_var,
+            values=("0.5", "1", "2", "3", "5", "10"),
+            width=8,
+        ).grid(row=3, column=1, sticky="w", padx=(8, 0), pady=(4, 0))
         return frame
 
     def _build_network_frame(self, parent: ttk.Frame) -> ttk.LabelFrame:
@@ -1284,8 +1398,12 @@ class SerialRelayApp(tk.Tk):
             baudrate = int(self.baudrate_var.get())
             local_port = int(self.local_port_var.get())
             remote_port = int(self.remote_port_var.get())
+            reconnect_interval = float(self.serial_reconnect_interval_var.get())
         except ValueError as exc:
-            raise ValueError("波特率、本地端口和目标端口必须是数字。") from exc
+            raise ValueError("波特率、本地端口、目标端口和重连间隔必须是数字。") from exc
+
+        if reconnect_interval <= 0:
+            raise ValueError("串口重连间隔必须大于 0 秒。")
 
         network_mode = self._network_mode_value()
         if network_mode in {"tcp_server", "udp_server"} and not 1 <= local_port <= 65535:
@@ -1307,6 +1425,8 @@ class SerialRelayApp(tk.Tk):
             dtr=self.dtr_var.get(),
             rts=self.rts_var.get(),
             reset_input=self.reset_input_var.get(),
+            auto_reconnect=self.serial_auto_reconnect_var.get(),
+            reconnect_interval=reconnect_interval,
         )
 
         access_rules = tuple(split_rules(self.access_text.get("1.0", "end")))
@@ -1427,6 +1547,8 @@ class SerialRelayApp(tk.Tk):
             "dtr": self.dtr_var.get(),
             "rts": self.rts_var.get(),
             "reset_input": self.reset_input_var.get(),
+            "serial_auto_reconnect": self.serial_auto_reconnect_var.get(),
+            "serial_reconnect_interval": self.serial_reconnect_interval_var.get(),
             "network_mode": self.network_mode_var.get(),
             "bind_host": bind_host_value(self.bind_host_var.get()),
             "local_port": self.local_port_var.get(),
@@ -1456,6 +1578,10 @@ class SerialRelayApp(tk.Tk):
         self.dtr_var.set(bool(data.get("dtr", self.dtr_var.get())))
         self.rts_var.set(bool(data.get("rts", self.rts_var.get())))
         self.reset_input_var.set(bool(data.get("reset_input", self.reset_input_var.get())))
+        self.serial_auto_reconnect_var.set(bool(data.get("serial_auto_reconnect", self.serial_auto_reconnect_var.get())))
+        self.serial_reconnect_interval_var.set(
+            data.get("serial_reconnect_interval", self.serial_reconnect_interval_var.get())
+        )
 
         network_mode = data.get("network_mode", self.network_mode_var.get())
         if network_mode not in NETWORK_MODES:
