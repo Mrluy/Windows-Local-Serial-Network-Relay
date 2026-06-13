@@ -29,7 +29,9 @@ python -m PyInstaller `
   --windowed `
   --name SerialTcpRelay `
   --icon $iconIco `
+  --version-file ".\version_info.txt" `
   --add-data "img\app.png;img" `
+  --hidden-import pystray._win32 `
   --hidden-import serial.tools.list_ports_windows `
   --hidden-import serial.tools.list_ports_common `
   .\serial_tcp_relay_gui.py

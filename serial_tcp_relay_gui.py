@@ -4,12 +4,14 @@
 from __future__ import annotations
 
 import datetime as dt
+import ctypes
 import fnmatch
 import ipaddress
 import json
 import os
 import queue
 import socket
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -20,15 +22,23 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Any, Callable
 
+import pystray
 import serial
+from PIL import Image
 from serial.tools import list_ports
 
 
 APP_NAME = "本地串口网络中继"
+APP_VERSION = "1.0.0"
 APP_DIR_NAME = "SerialTcpRelay"
 APP_ICON_PATH = Path("img") / "app.png"
 BIND_ALL_VALUE = "0.0.0.0"
 BIND_ALL_LABEL = "允许所有"
+SETTINGS_FILE_NAME = "settings.json"
+LOG_DIR_NAME = "log"
+SYSTEM_LOG_DB_NAME = "system_logs.sqlite"
+DATA_LOG_DB_NAME = "data_logs.sqlite"
+WINDOWS_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 SERIAL_READ_SIZE = 4096
 TCP_READ_SIZE = 4096
 
@@ -81,6 +91,8 @@ class RelaySettings:
     access_mode: str
     access_rules: tuple[str, ...]
     hex_log: bool
+    network_auto_reconnect: bool
+    network_reconnect_interval: float
 
 
 @dataclass(eq=False)
@@ -145,6 +157,390 @@ class AccessControl:
                     return True
 
         return any(fnmatch.fnmatch(ip, pattern) for pattern in self.patterns)
+
+
+class LogStore:
+    def __init__(self, log_dir: Path) -> None:
+        self.log_dir = log_dir
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        self.system_db_path = self.log_dir / SYSTEM_LOG_DB_NAME
+        self.data_db_path = self.log_dir / DATA_LOG_DB_NAME
+        self._system_lock = threading.Lock()
+        self._data_lock = threading.Lock()
+        self._system_conn = sqlite3.connect(self.system_db_path, check_same_thread=False)
+        self._data_conn = sqlite3.connect(self.data_db_path, check_same_thread=False)
+        self._init_databases()
+
+    def close(self) -> None:
+        with self._system_lock:
+            self._system_conn.close()
+        with self._data_lock:
+            self._data_conn.close()
+
+    def log_system(self, level: str, message: str, category: str = "运行日志", peer: str = "", detail: str = "") -> None:
+        created_at = time.time()
+        time_text = dt.datetime.fromtimestamp(created_at).strftime("%Y-%m-%d %H:%M:%S")
+        with self._system_lock:
+            self._system_conn.execute(
+                """
+                INSERT INTO system_logs(created_at, time_text, level, category, peer, message, detail)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (created_at, time_text, level, category, peer, message, detail),
+            )
+            self._system_conn.commit()
+            self._prune_system_locked(created_at)
+
+    def log_data(self, peer: str, direction: str, byte_count: int, hex_data: str) -> None:
+        created_at = time.time()
+        time_text = dt.datetime.fromtimestamp(created_at).strftime("%Y-%m-%d %H:%M:%S")
+        with self._data_lock:
+            self._data_conn.execute(
+                """
+                INSERT INTO data_logs(created_at, time_text, peer, direction, byte_count, hex_data)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (created_at, time_text, peer, direction, byte_count, hex_data),
+            )
+            self._data_conn.commit()
+            self._prune_data_locked(created_at)
+
+    def query(self, log_type: str, keyword: str, start_ts: float | None, end_ts: float | None, limit: int = 1000) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        if log_type in {"全部", "运行日志", "连接记录"}:
+            rows.extend(self._query_system(log_type, keyword, start_ts, end_ts, limit))
+        if log_type in {"全部", "数据收发"}:
+            rows.extend(self._query_data(keyword, start_ts, end_ts, limit))
+        rows.sort(key=lambda item: item["created_at"], reverse=True)
+        return rows[:limit]
+
+    def _init_databases(self) -> None:
+        with self._system_lock:
+            self._system_conn.execute("PRAGMA journal_mode=WAL")
+            self._system_conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS system_logs(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at REAL NOT NULL,
+                    time_text TEXT NOT NULL,
+                    level TEXT NOT NULL,
+                    category TEXT NOT NULL,
+                    peer TEXT NOT NULL DEFAULT '',
+                    message TEXT NOT NULL,
+                    detail TEXT NOT NULL DEFAULT ''
+                )
+                """
+            )
+            self._system_conn.execute("CREATE INDEX IF NOT EXISTS idx_system_created_at ON system_logs(created_at)")
+            self._system_conn.execute("CREATE INDEX IF NOT EXISTS idx_system_category ON system_logs(category)")
+            self._system_conn.commit()
+
+        with self._data_lock:
+            self._data_conn.execute("PRAGMA journal_mode=WAL")
+            self._data_conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS data_logs(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at REAL NOT NULL,
+                    time_text TEXT NOT NULL,
+                    peer TEXT NOT NULL,
+                    direction TEXT NOT NULL,
+                    byte_count INTEGER NOT NULL,
+                    hex_data TEXT NOT NULL
+                )
+                """
+            )
+            self._data_conn.execute("CREATE INDEX IF NOT EXISTS idx_data_created_at ON data_logs(created_at)")
+            self._data_conn.execute("CREATE INDEX IF NOT EXISTS idx_data_direction ON data_logs(direction)")
+            self._data_conn.commit()
+
+    def _query_system(
+        self,
+        log_type: str,
+        keyword: str,
+        start_ts: float | None,
+        end_ts: float | None,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        sql = "SELECT created_at, time_text, category, level, peer, message, detail FROM system_logs WHERE 1=1"
+        params: list[Any] = []
+        if log_type in {"运行日志", "连接记录"}:
+            sql += " AND category = ?"
+            params.append(log_type)
+        if start_ts is not None:
+            sql += " AND created_at >= ?"
+            params.append(start_ts)
+        if end_ts is not None:
+            sql += " AND created_at <= ?"
+            params.append(end_ts)
+        if keyword:
+            like = f"%{keyword}%"
+            sql += " AND (level LIKE ? OR peer LIKE ? OR message LIKE ? OR detail LIKE ?)"
+            params.extend([like, like, like, like])
+        sql += " ORDER BY created_at DESC LIMIT ?"
+        params.append(limit)
+        with self._system_lock:
+            records = self._system_conn.execute(sql, params).fetchall()
+        return [
+            {
+                "created_at": row[0],
+                "time": row[1],
+                "type": row[2],
+                "level": row[3],
+                "peer": row[4],
+                "bytes": "",
+                "message": row[5] if not row[6] else f"{row[5]} {row[6]}",
+            }
+            for row in records
+        ]
+
+    def _query_data(
+        self,
+        keyword: str,
+        start_ts: float | None,
+        end_ts: float | None,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        sql = "SELECT created_at, time_text, peer, direction, byte_count, hex_data FROM data_logs WHERE 1=1"
+        params: list[Any] = []
+        if start_ts is not None:
+            sql += " AND created_at >= ?"
+            params.append(start_ts)
+        if end_ts is not None:
+            sql += " AND created_at <= ?"
+            params.append(end_ts)
+        if keyword:
+            like = f"%{keyword}%"
+            sql += " AND (peer LIKE ? OR direction LIKE ? OR hex_data LIKE ?)"
+            params.extend([like, like, like])
+        sql += " ORDER BY created_at DESC LIMIT ?"
+        params.append(limit)
+        with self._data_lock:
+            records = self._data_conn.execute(sql, params).fetchall()
+        return [
+            {
+                "created_at": row[0],
+                "time": row[1],
+                "type": "数据收发",
+                "level": row[3],
+                "peer": row[2],
+                "bytes": str(row[4]),
+                "message": row[5],
+            }
+            for row in records
+        ]
+
+    def _prune_data_locked(self, now_ts: float) -> None:
+        oldest = self._data_conn.execute("SELECT MIN(created_at) FROM data_logs").fetchone()[0]
+        if oldest is not None and oldest < now_ts - 25 * 3600:
+            self._data_conn.execute("DELETE FROM data_logs WHERE created_at < ?", (now_ts - 24 * 3600,))
+            self._data_conn.commit()
+
+    def _prune_system_locked(self, now_ts: float) -> None:
+        oldest = self._system_conn.execute("SELECT MIN(created_at) FROM system_logs").fetchone()[0]
+        if oldest is not None and oldest < now_ts - 190 * 86400:
+            self._system_conn.execute("DELETE FROM system_logs WHERE created_at < ?", (now_ts - 180 * 86400,))
+            self._system_conn.commit()
+
+        count = self._system_conn.execute("SELECT COUNT(*) FROM system_logs").fetchone()[0]
+        if count >= 105000:
+            self._system_conn.execute(
+                "DELETE FROM system_logs WHERE id IN (SELECT id FROM system_logs ORDER BY id LIMIT 5000)"
+            )
+            self._system_conn.commit()
+
+
+class LogViewer(tk.Toplevel):
+    def __init__(self, master: tk.Tk, log_store: LogStore) -> None:
+        super().__init__(master)
+        self.log_store = log_store
+        self.rows: list[dict[str, Any]] = []
+
+        self.title("查看日志")
+        self.minsize(980, 560)
+        self.transient(master)
+
+        self.log_type_var = tk.StringVar(value="全部")
+        self.keyword_var = tk.StringVar(value="")
+        self.start_time_var = tk.StringVar(value="")
+        self.end_time_var = tk.StringVar(value="")
+
+        self._build_ui()
+        self._refresh()
+
+    def _build_ui(self) -> None:
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(1, weight=1)
+
+        filters = ttk.Frame(self, padding=(10, 10, 10, 6))
+        filters.grid(row=0, column=0, sticky="ew")
+        filters.columnconfigure(3, weight=1)
+
+        ttk.Label(filters, text="类型").grid(row=0, column=0, sticky="w")
+        ttk.Combobox(
+            filters,
+            textvariable=self.log_type_var,
+            values=("全部", "运行日志", "连接记录", "数据收发"),
+            state="readonly",
+            width=12,
+        ).grid(row=0, column=1, sticky="w", padx=(6, 14))
+
+        ttk.Label(filters, text="关键字").grid(row=0, column=2, sticky="w")
+        keyword_entry = ttk.Entry(filters, textvariable=self.keyword_var)
+        keyword_entry.grid(row=0, column=3, sticky="ew", padx=(6, 14))
+        keyword_entry.bind("<Return>", lambda _event: self._refresh())
+
+        ttk.Label(filters, text="开始").grid(row=0, column=4, sticky="w")
+        ttk.Entry(filters, textvariable=self.start_time_var, width=19).grid(row=0, column=5, sticky="w", padx=(6, 14))
+        ttk.Label(filters, text="结束").grid(row=0, column=6, sticky="w")
+        ttk.Entry(filters, textvariable=self.end_time_var, width=19).grid(row=0, column=7, sticky="w", padx=(6, 0))
+
+        actions = ttk.Frame(filters)
+        actions.grid(row=1, column=0, columnspan=8, sticky="ew", pady=(8, 0))
+        ttk.Button(actions, text="查询", command=self._refresh).grid(row=0, column=0)
+        ttk.Button(actions, text="最近24小时", command=self._set_recent_day).grid(row=0, column=1, padx=(8, 0))
+        ttk.Button(actions, text="清空条件", command=self._clear_filters).grid(row=0, column=2, padx=(8, 0))
+        ttk.Button(actions, text="导出结果", command=self._export_results).grid(row=0, column=3, padx=(8, 0))
+        self.count_var = tk.StringVar(value="")
+        ttk.Label(actions, textvariable=self.count_var).grid(row=0, column=4, sticky="w", padx=(14, 0))
+
+        body = ttk.Frame(self, padding=(10, 0, 10, 10))
+        body.grid(row=1, column=0, sticky="nsew")
+        body.columnconfigure(0, weight=1)
+        body.rowconfigure(0, weight=1)
+        body.rowconfigure(2, weight=0)
+
+        self.tree = ttk.Treeview(
+            body,
+            columns=("time", "type", "level", "peer", "bytes", "message"),
+            show="headings",
+            height=16,
+        )
+        for column, title, width, anchor in (
+            ("time", "时间", 150, "w"),
+            ("type", "类型", 86, "w"),
+            ("level", "级别/方向", 100, "w"),
+            ("peer", "对端", 180, "w"),
+            ("bytes", "字节", 70, "e"),
+            ("message", "内容", 480, "w"),
+        ):
+            self.tree.heading(column, text=title)
+            self.tree.column(column, width=width, anchor=anchor, stretch=(column == "message"))
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        self.tree.bind("<<TreeviewSelect>>", self._show_selected_detail)
+
+        tree_scroll_y = ttk.Scrollbar(body, orient="vertical", command=self.tree.yview)
+        tree_scroll_y.grid(row=0, column=1, sticky="ns")
+        tree_scroll_x = ttk.Scrollbar(body, orient="horizontal", command=self.tree.xview)
+        tree_scroll_x.grid(row=1, column=0, sticky="ew")
+        self.tree.configure(yscrollcommand=tree_scroll_y.set, xscrollcommand=tree_scroll_x.set)
+
+        self.detail_text = tk.Text(body, height=5, wrap="word", state="disabled")
+        self.detail_text.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+
+    def _refresh(self) -> None:
+        try:
+            start_ts = parse_log_time(self.start_time_var.get(), is_end=False)
+            end_ts = parse_log_time(self.end_time_var.get(), is_end=True)
+        except ValueError as exc:
+            messagebox.showerror("查看日志", str(exc), parent=self)
+            return
+
+        if start_ts is not None and end_ts is not None and start_ts > end_ts:
+            messagebox.showerror("查看日志", "开始时间不能晚于结束时间。", parent=self)
+            return
+
+        self.rows = self.log_store.query(
+            self.log_type_var.get(),
+            self.keyword_var.get().strip(),
+            start_ts,
+            end_ts,
+            limit=1000,
+        )
+
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        for index, row in enumerate(self.rows):
+            self.tree.insert(
+                "",
+                "end",
+                iid=str(index),
+                values=(
+                    row["time"],
+                    row["type"],
+                    row["level"],
+                    row["peer"],
+                    row["bytes"],
+                    truncate_text(str(row["message"]), 500),
+                ),
+            )
+        self.count_var.set(f"显示 {len(self.rows)} 条")
+        self._set_detail("")
+
+    def _set_recent_day(self) -> None:
+        now = dt.datetime.now()
+        self.start_time_var.set((now - dt.timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S"))
+        self.end_time_var.set(now.strftime("%Y-%m-%d %H:%M:%S"))
+        self._refresh()
+
+    def _clear_filters(self) -> None:
+        self.log_type_var.set("全部")
+        self.keyword_var.set("")
+        self.start_time_var.set("")
+        self.end_time_var.set("")
+        self._refresh()
+
+    def _show_selected_detail(self, _event: tk.Event) -> None:
+        selection = self.tree.selection()
+        if not selection:
+            self._set_detail("")
+            return
+        row = self.rows[int(selection[0])]
+        detail = (
+            f"时间: {row['time']}\n"
+            f"类型: {row['type']}\n"
+            f"级别/方向: {row['level']}\n"
+            f"对端: {row['peer']}\n"
+            f"字节: {row['bytes']}\n"
+            f"内容: {row['message']}"
+        )
+        self._set_detail(detail)
+
+    def _set_detail(self, text: str) -> None:
+        self.detail_text.configure(state="normal")
+        self.detail_text.delete("1.0", "end")
+        self.detail_text.insert("1.0", text)
+        self.detail_text.configure(state="disabled")
+
+    def _export_results(self) -> None:
+        if not self.rows:
+            self._refresh()
+            if not self.rows:
+                return
+        path = filedialog.asksaveasfilename(
+            parent=self,
+            title="导出日志查询结果",
+            defaultextension=".tsv",
+            filetypes=[("TSV files", "*.tsv"), ("Text files", "*.txt"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        lines = ["时间\t类型\t级别/方向\t对端\t字节\t内容"]
+        for row in self.rows:
+            lines.append(
+                "\t".join(
+                    clean_tsv(value)
+                    for value in (
+                        row["time"],
+                        row["type"],
+                        row["level"],
+                        row["peer"],
+                        row["bytes"],
+                        row["message"],
+                    )
+                )
+            )
+        Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 class SerialTcpRelay:
@@ -231,6 +627,7 @@ class SerialTcpRelay:
                 ).start()
         finally:
             self.stop()
+            self._emit_serial_status("串口: 已停止")
             self._emit_status(False, "已停止")
             self._log("INFO", "服务已停止")
 
@@ -492,10 +889,12 @@ class SerialNetworkRelay:
             try:
                 self._serial = self._open_serial(self.settings.serial)
                 self._log("INFO", f"已打开串口 {self._serial_label()}")
+                self._emit_serial_status("串口: 在线")
             except (OSError, serial.SerialException) as exc:
                 if not self.settings.serial.auto_reconnect:
                     raise
                 self._serial = None
+                self._emit_serial_status("串口: 重连中")
                 self._log(
                     "WARN",
                     f"打开串口失败: {exc}。服务会继续运行，并每 {self.settings.serial.reconnect_interval:g} 秒尝试重连。",
@@ -577,23 +976,37 @@ class SerialNetworkRelay:
         if not access.allows(remote[0]):
             raise PermissionError(f"目标地址 {remote[0]} 被访问控制拒绝")
 
-        conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        if self.settings.bind_host != BIND_ALL_VALUE or self.settings.local_port > 0:
-            conn.bind((self.settings.bind_host, self.settings.local_port))
-        conn.settimeout(8)
-        conn.connect(remote)
-        conn.settimeout(0.5)
-        self._network_socket = conn
-
-        key = self._register_tcp_client(conn, remote[0], remote[1])
-        if key is None:
-            safe_close(conn)
-            raise RuntimeError("无法注册 TCP 连接")
-
-        self._log("INFO", f"TCP Client 已连接 {remote[0]}:{remote[1]}")
-        self._emit_status(True, "运行中")
         self._start_serial_reader()
-        self._tcp_to_serial_loop(key, conn)
+
+        while not self._stop_event.is_set():
+            conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                if self.settings.bind_host != BIND_ALL_VALUE or self.settings.local_port > 0:
+                    conn.bind((self.settings.bind_host, self.settings.local_port))
+                conn.settimeout(8)
+                conn.connect(remote)
+                conn.settimeout(0.5)
+                self._network_socket = conn
+
+                key = self._register_tcp_client(conn, remote[0], remote[1])
+                if key is None:
+                    raise RuntimeError("无法注册 TCP 连接")
+
+                self._log("INFO", f"TCP Client 已连接 {remote[0]}:{remote[1]}")
+                self._emit_status(True, "运行中")
+                self._tcp_to_serial_loop(key, conn)
+            except OSError as exc:
+                safe_close(conn)
+                if self._stop_event.is_set():
+                    break
+                self._log("WARN", f"TCP Client 连接失败或已断开: {exc}")
+                self._notify("TCP Client 已断开", str(exc))
+
+            if not self.settings.network_auto_reconnect or self._stop_event.is_set():
+                break
+            self._emit_status(True, "运行中（网络重连中）")
+            self._log("INFO", f"{self.settings.network_reconnect_interval:g} 秒后重连 TCP 目标 {remote[0]}:{remote[1]}")
+            self._stop_event.wait(self.settings.network_reconnect_interval)
 
     def _run_udp_server(self, access: AccessControl) -> None:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -635,35 +1048,47 @@ class SerialNetworkRelay:
         if not access.allows(remote[0]):
             raise PermissionError(f"目标地址 {remote[0]} 被访问控制拒绝")
 
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        if self.settings.bind_host != BIND_ALL_VALUE or self.settings.local_port > 0:
-            sock.bind((self.settings.bind_host, self.settings.local_port))
-        sock.connect(remote)
-        sock.settimeout(0.5)
-        self._network_socket = sock
-        self._udp_socket = sock
-
-        session = self._register_udp_peer(remote)
-        if session is None:
-            safe_close(sock)
-            raise RuntimeError("无法注册 UDP 对端")
-
-        self._log("INFO", f"UDP Client 已连接 {remote[0]}:{remote[1]}")
-        self._emit_status(True, "运行中")
         self._start_serial_reader()
 
         while not self._stop_event.is_set():
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             try:
-                data = sock.recv(TCP_READ_SIZE)
-            except socket.timeout:
-                continue
-            except OSError:
-                if not self._stop_event.is_set():
-                    raise
-                break
+                if self.settings.bind_host != BIND_ALL_VALUE or self.settings.local_port > 0:
+                    sock.bind((self.settings.bind_host, self.settings.local_port))
+                sock.connect(remote)
+                sock.settimeout(0.5)
+                self._network_socket = sock
+                self._udp_socket = sock
 
-            if data:
-                self._write_serial_from_network(session, data)
+                session = self._register_udp_peer(remote)
+                if session is None:
+                    raise RuntimeError("无法注册 UDP 对端")
+
+                self._log("INFO", f"UDP Client 已连接 {remote[0]}:{remote[1]}")
+                self._emit_status(True, "运行中")
+
+                while not self._stop_event.is_set():
+                    try:
+                        data = sock.recv(TCP_READ_SIZE)
+                    except socket.timeout:
+                        continue
+                    if data:
+                        self._write_serial_from_network(session, data)
+            except OSError as exc:
+                safe_close(sock)
+                if not self._stop_event.is_set():
+                    self._log("WARN", f"UDP Client 网络错误: {exc}")
+                    self._notify("UDP Client 网络错误", str(exc))
+            finally:
+                self._udp_socket = None
+                self._network_socket = None
+                self._unregister_session(("UDP", remote[0], remote[1]), "网络重连")
+
+            if not self.settings.network_auto_reconnect or self._stop_event.is_set():
+                break
+            self._emit_status(True, "运行中（网络重连中）")
+            self._log("INFO", f"{self.settings.network_reconnect_interval:g} 秒后重连 UDP 目标 {remote[0]}:{remote[1]}")
+            self._stop_event.wait(self.settings.network_reconnect_interval)
 
     def _start_serial_reader(self) -> None:
         if self._serial_reader_started:
@@ -773,6 +1198,7 @@ class SerialNetworkRelay:
         )
         self._record(session.peer, "已断开", detail)
         self._log("INFO", f"对端已断开 {session.peer}: {detail}")
+        self._notify("对端已断开", f"{session.peer} {reason}")
         self._emit_clients()
 
     def _tcp_to_serial_loop(self, key: socket.socket, conn: socket.socket) -> None:
@@ -797,8 +1223,6 @@ class SerialNetworkRelay:
                 break
 
         self._unregister_session(key, reason)
-        if self.settings.network_mode == "tcp_client":
-            self._stop_event.set()
 
     def _write_serial_from_network(self, session: ClientSession, data: bytes) -> bool:
         if self._serial is None:
@@ -853,10 +1277,12 @@ class SerialNetworkRelay:
 
         if not self.settings.serial.auto_reconnect:
             self._log("ERROR", f"{action}: {exc}")
+            self._emit_serial_status("串口: 错误")
             self._stop_event.set()
             return False
 
         self._mark_serial_offline()
+        self._emit_serial_status("串口: 重连中")
         self._log(
             "WARN",
             f"{action}: {exc}。串口已离线，服务保持运行，并每 {self.settings.serial.reconnect_interval:g} 秒尝试重连。",
@@ -913,7 +1339,9 @@ class SerialNetworkRelay:
                 return
 
             self._log("INFO", f"串口已重新连接 {self._serial_label()}")
+            self._emit_serial_status("串口: 在线")
             self._emit_status(True, "运行中")
+            self._notify("串口已重新连接", self._serial_label())
             return
 
     def _broadcast(self, data: bytes) -> None:
@@ -993,6 +1421,12 @@ class SerialNetworkRelay:
     def _emit_status(self, running: bool, text: str) -> None:
         self.emit("status", {"running": running, "text": text})
 
+    def _emit_serial_status(self, text: str) -> None:
+        self.emit("serial_status", {"text": text})
+
+    def _notify(self, title: str, message: str) -> None:
+        self.emit("notify", {"title": title, "message": message})
+
     def _close_network_socket(self) -> None:
         network_socket = self._network_socket
         self._network_socket = None
@@ -1014,15 +1448,19 @@ class SerialNetworkRelay:
 
 
 class SerialRelayApp(tk.Tk):
-    def __init__(self) -> None:
+    def __init__(self, start_minimized: bool = False) -> None:
         super().__init__()
         self.title(APP_NAME)
         self._set_window_icon()
         self.minsize(980, 680)
 
         self.event_queue: queue.Queue[tuple[str, dict[str, Any]]] = queue.Queue()
+        self.log_store = LogStore(log_dir_path())
         self.relay: SerialNetworkRelay | None = None
         self.running = False
+        self._allow_exit = False
+        self._start_minimized = start_minimized
+        self.tray_icon: pystray.Icon | None = None
 
         self._build_variables()
         self._build_ui()
@@ -1030,6 +1468,12 @@ class SerialRelayApp(tk.Tk):
         self._refresh_ports()
         self._refresh_bind_hosts()
         self._update_network_mode_state()
+        self._create_tray_icon()
+        self._append_log("INFO", f"{APP_NAME} v{APP_VERSION} 已启动，程序目录: {app_root()}")
+        if self.auto_start_service_var.get():
+            self.after(700, self._start)
+        if self._start_minimized:
+            self.after(300, self._hide_to_tray)
         self._poll_events()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -1064,8 +1508,14 @@ class SerialRelayApp(tk.Tk):
         self.access_mode_var = tk.StringVar(value=ACCESS_MODE_LABELS["allow_all"])
         self.hex_log_var = tk.BooleanVar(value=False)
         self.autoscroll_var = tk.BooleanVar(value=True)
+        self.start_with_windows_var = tk.BooleanVar(value=False)
+        self.auto_start_service_var = tk.BooleanVar(value=False)
+        self.close_to_tray_var = tk.BooleanVar(value=True)
+        self.network_auto_reconnect_var = tk.BooleanVar(value=True)
+        self.network_reconnect_interval_var = tk.StringVar(value="3")
 
         self.status_var = tk.StringVar(value="已停止")
+        self.serial_status_var = tk.StringVar(value="串口: 未启动")
         self.address_hint_var = tk.StringVar(value="")
         self.network_mode_var.trace_add("write", lambda *_: self._on_network_mode_changed())
         self.bind_host_var.trace_add("write", lambda *_: self._update_address_hint())
@@ -1084,11 +1534,12 @@ class SerialRelayApp(tk.Tk):
         ttk.Label(top, text="状态:").grid(row=0, column=0, sticky="w")
         self.status_label = ttk.Label(top, textvariable=self.status_var, foreground="#9a3412")
         self.status_label.grid(row=0, column=1, sticky="w", padx=(6, 18))
-        ttk.Label(top, textvariable=self.address_hint_var).grid(row=0, column=2, sticky="e", padx=(6, 14))
+        ttk.Label(top, textvariable=self.serial_status_var).grid(row=0, column=2, sticky="w", padx=(6, 18))
+        ttk.Label(top, textvariable=self.address_hint_var).grid(row=0, column=3, sticky="e", padx=(6, 14))
         self.start_button = ttk.Button(top, text="启动", command=self._start)
-        self.start_button.grid(row=0, column=3, padx=(0, 8))
+        self.start_button.grid(row=0, column=4, padx=(0, 8))
         self.stop_button = ttk.Button(top, text="停止", command=self._stop, state="disabled")
-        self.stop_button.grid(row=0, column=4)
+        self.stop_button.grid(row=0, column=5)
 
         settings = ttk.Frame(self, padding=(10, 4, 10, 8))
         settings.grid(row=1, column=0, sticky="ew")
@@ -1199,7 +1650,17 @@ class SerialRelayApp(tk.Tk):
         options.grid(row=6, column=0, columnspan=3, sticky="ew", padx=8, pady=(4, 8))
         ttk.Checkbutton(options, text="十六进制日志", variable=self.hex_log_var).grid(row=0, column=0, sticky="w")
         ttk.Checkbutton(options, text="日志自动滚动", variable=self.autoscroll_var).grid(row=0, column=1, sticky="w", padx=(12, 0))
-        ttk.Button(options, text="复制地址", command=self._copy_address).grid(row=1, column=0, sticky="w", pady=(8, 0))
+        ttk.Checkbutton(options, text="Client 自动重连", variable=self.network_auto_reconnect_var).grid(
+            row=1, column=0, sticky="w", pady=(6, 0)
+        )
+        ttk.Label(options, text="网络重连间隔(秒)").grid(row=1, column=1, sticky="w", padx=(12, 0), pady=(6, 0))
+        ttk.Combobox(
+            options,
+            textvariable=self.network_reconnect_interval_var,
+            values=("1", "2", "3", "5", "10", "30"),
+            width=8,
+        ).grid(row=1, column=2, sticky="w", padx=(8, 0), pady=(6, 0))
+        ttk.Button(options, text="复制地址", command=self._copy_address).grid(row=2, column=0, sticky="w", pady=(8, 0))
         return frame
 
     def _build_policy_frame(self, parent: ttk.Frame) -> ttk.LabelFrame:
@@ -1224,6 +1685,16 @@ class SerialRelayApp(tk.Tk):
         buttons = ttk.Frame(frame)
         buttons.grid(row=3, column=0, sticky="ew", padx=8, pady=(4, 8))
         ttk.Button(buttons, text="清空", command=lambda: self.access_text.delete("1.0", "end")).grid(row=0, column=0)
+
+        run_options = ttk.Frame(frame)
+        run_options.grid(row=4, column=0, sticky="ew", padx=8, pady=(0, 8))
+        ttk.Checkbutton(run_options, text="开机启动", variable=self.start_with_windows_var).grid(row=0, column=0, sticky="w")
+        ttk.Checkbutton(run_options, text="启动后自动启动服务", variable=self.auto_start_service_var).grid(
+            row=1, column=0, sticky="w", pady=(4, 0)
+        )
+        ttk.Checkbutton(run_options, text="关闭按钮最小化到托盘", variable=self.close_to_tray_var).grid(
+            row=2, column=0, sticky="w", pady=(4, 0)
+        )
         return frame
 
     def _build_client_frame(self, parent: ttk.PanedWindow) -> None:
@@ -1299,6 +1770,9 @@ class SerialRelayApp(tk.Tk):
         buttons.grid(row=2, column=0, columnspan=2, sticky="ew", padx=8, pady=(0, 8))
         ttk.Button(buttons, text="清空日志", command=self._clear_logs).grid(row=0, column=0)
         ttk.Button(buttons, text="导出日志", command=self._export_logs).grid(row=0, column=1, padx=(8, 0))
+        ttk.Button(buttons, text="查看日志", command=self._open_log_viewer).grid(row=0, column=2, padx=(8, 0))
+        ttk.Button(buttons, text="导出配置", command=self._export_settings).grid(row=0, column=3, padx=(8, 0))
+        ttk.Button(buttons, text="导入配置", command=self._import_settings).grid(row=0, column=4, padx=(8, 0))
         parent.add(frame, weight=2)
 
     def _refresh_ports(self) -> None:
@@ -1351,6 +1825,42 @@ class SerialRelayApp(tk.Tk):
         self.clipboard_append(address)
         self._append_log("INFO", f"已复制连接地址: {address}")
 
+    def _create_tray_icon(self) -> None:
+        if self.tray_icon is not None:
+            return
+        try:
+            image = Image.open(resource_path(APP_ICON_PATH))
+        except OSError:
+            image = Image.new("RGBA", (64, 64), "#2563eb")
+        menu = pystray.Menu(
+            pystray.MenuItem("显示窗口", lambda: self.after(0, self._show_window)),
+            pystray.MenuItem("启动服务", lambda: self.after(0, self._start)),
+            pystray.MenuItem("停止服务", lambda: self.after(0, self._stop)),
+            pystray.MenuItem("退出", lambda: self.after(0, self._exit_from_tray)),
+        )
+        self.tray_icon = pystray.Icon(APP_NAME, image, APP_NAME, menu)
+        threading.Thread(target=self.tray_icon.run, name="tray-icon", daemon=True).start()
+
+    def _show_window(self) -> None:
+        self.deiconify()
+        self.lift()
+        self.focus_force()
+
+    def _hide_to_tray(self) -> None:
+        self.withdraw()
+        self._notify(APP_NAME, "程序已最小化到托盘")
+
+    def _exit_from_tray(self) -> None:
+        self._allow_exit = True
+        self._on_close()
+
+    def _notify(self, title: str, message: str) -> None:
+        try:
+            if self.tray_icon is not None:
+                self.tray_icon.notify(message, title)
+        except Exception:
+            pass
+
     def _current_connect_address(self) -> str:
         mode = self._network_mode_value()
         if mode in {"tcp_client", "udp_client"}:
@@ -1372,6 +1882,8 @@ class SerialRelayApp(tk.Tk):
         self.address_hint_var.set(f"{prefix}: {self._current_connect_address()}")
 
     def _start(self) -> None:
+        if self.running:
+            return
         try:
             settings = self._collect_settings()
         except ValueError as exc:
@@ -1381,6 +1893,7 @@ class SerialRelayApp(tk.Tk):
         self._save_settings()
         self._set_controls_running(True)
         self._append_log("INFO", "正在启动服务")
+        self._append_log("INFO", f"版本: {APP_VERSION}; 启动参数: {settings_summary(settings)}")
         self.relay = SerialNetworkRelay(settings, lambda kind, payload: self.event_queue.put((kind, payload)))
         self.relay.start()
 
@@ -1399,11 +1912,14 @@ class SerialRelayApp(tk.Tk):
             local_port = int(self.local_port_var.get())
             remote_port = int(self.remote_port_var.get())
             reconnect_interval = float(self.serial_reconnect_interval_var.get())
+            network_reconnect_interval = float(self.network_reconnect_interval_var.get())
         except ValueError as exc:
             raise ValueError("波特率、本地端口、目标端口和重连间隔必须是数字。") from exc
 
         if reconnect_interval <= 0:
             raise ValueError("串口重连间隔必须大于 0 秒。")
+        if network_reconnect_interval <= 0:
+            raise ValueError("网络重连间隔必须大于 0 秒。")
 
         network_mode = self._network_mode_value()
         if network_mode in {"tcp_server", "udp_server"} and not 1 <= local_port <= 65535:
@@ -1441,6 +1957,8 @@ class SerialRelayApp(tk.Tk):
             access_mode=ACCESS_MODES[self.access_mode_var.get()],
             access_rules=access_rules,
             hex_log=self.hex_log_var.get(),
+            network_auto_reconnect=self.network_auto_reconnect_var.get(),
+            network_reconnect_interval=network_reconnect_interval,
         )
 
     def _set_controls_running(self, running: bool) -> None:
@@ -1471,11 +1989,16 @@ class SerialRelayApp(tk.Tk):
             self._insert_record(payload)
         elif kind == "clients":
             self._update_clients(payload["clients"])
+        elif kind == "serial_status":
+            self.serial_status_var.set(str(payload["text"]))
+        elif kind == "notify":
+            self._notify(str(payload["title"]), str(payload["message"]))
 
     def _handle_traffic(self, payload: dict[str, Any]) -> None:
         message = f"{payload['peer']} {payload['direction']} {payload['byte_count']} B"
         if self.hex_log_var.get():
             message += f"  {payload['hex']}"
+        self.log_store.log_data(str(payload["peer"]), str(payload["direction"]), int(payload["byte_count"]), str(payload["hex"]))
         self._append_log("DATA", message)
 
     def _insert_record(self, payload: dict[str, Any]) -> None:
@@ -1488,6 +2011,7 @@ class SerialRelayApp(tk.Tk):
         if len(children) > 1000:
             self.records_tree.delete(children[0])
         self.records_tree.yview_moveto(1)
+        self.log_store.log_system(str(payload["event"]), str(payload["detail"]), "连接记录", str(payload["peer"]))
 
     def _update_clients(self, clients: list[dict[str, Any]]) -> None:
         for item in self.clients_tree.get_children():
@@ -1517,6 +2041,8 @@ class SerialRelayApp(tk.Tk):
         if self.autoscroll_var.get():
             self.log_text.see("end")
         self.log_text.configure(state="disabled")
+        if level != "DATA":
+            self.log_store.log_system(level, message, "运行日志")
 
     def _clear_logs(self) -> None:
         self.log_text.configure(state="normal")
@@ -1536,6 +2062,37 @@ class SerialRelayApp(tk.Tk):
         text = self.log_text.get("1.0", "end")
         Path(path).write_text(text, encoding="utf-8")
         self._append_log("INFO", f"日志已导出: {path}")
+
+    def _open_log_viewer(self) -> None:
+        LogViewer(self, self.log_store)
+
+    def _export_settings(self) -> None:
+        path = filedialog.asksaveasfilename(
+            title="导出配置",
+            defaultextension=".json",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        self._save_settings()
+        Path(path).write_text(json.dumps(self._settings_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
+        self._append_log("INFO", f"配置已导出: {path}")
+
+    def _import_settings(self) -> None:
+        path = filedialog.askopenfilename(
+            title="导入配置",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            data = json.loads(Path(path).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            messagebox.showerror(APP_NAME, f"导入配置失败: {exc}")
+            return
+        self._apply_settings_dict(data)
+        self._save_settings()
+        self._append_log("INFO", f"配置已导入: {path}")
 
     def _settings_dict(self) -> dict[str, Any]:
         return {
@@ -1559,6 +2116,11 @@ class SerialRelayApp(tk.Tk):
             "access_rules": self.access_text.get("1.0", "end").strip(),
             "hex_log": self.hex_log_var.get(),
             "autoscroll": self.autoscroll_var.get(),
+            "start_with_windows": self.start_with_windows_var.get(),
+            "auto_start_service": self.auto_start_service_var.get(),
+            "close_to_tray": self.close_to_tray_var.get(),
+            "network_auto_reconnect": self.network_auto_reconnect_var.get(),
+            "network_reconnect_interval": self.network_reconnect_interval_var.get(),
         }
 
     def _load_settings(self) -> None:
@@ -1570,6 +2132,9 @@ class SerialRelayApp(tk.Tk):
         except (OSError, json.JSONDecodeError):
             return
 
+        self._apply_settings_dict(data)
+
+    def _apply_settings_dict(self, data: dict[str, Any]) -> None:
         self.serial_port_var.set(data.get("serial_port", self.serial_port_var.get()))
         self.baudrate_var.set(data.get("baudrate", self.baudrate_var.get()))
         self.data_bits_var.set(data.get("data_bits", self.data_bits_var.get()))
@@ -1595,6 +2160,15 @@ class SerialRelayApp(tk.Tk):
         self.access_mode_var.set(data.get("access_mode", self.access_mode_var.get()))
         self.hex_log_var.set(bool(data.get("hex_log", self.hex_log_var.get())))
         self.autoscroll_var.set(bool(data.get("autoscroll", self.autoscroll_var.get())))
+        self.start_with_windows_var.set(bool(data.get("start_with_windows", self.start_with_windows_var.get())))
+        self.auto_start_service_var.set(bool(data.get("auto_start_service", self.auto_start_service_var.get())))
+        self.close_to_tray_var.set(bool(data.get("close_to_tray", self.close_to_tray_var.get())))
+        self.network_auto_reconnect_var.set(
+            bool(data.get("network_auto_reconnect", self.network_auto_reconnect_var.get()))
+        )
+        self.network_reconnect_interval_var.set(
+            data.get("network_reconnect_interval", self.network_reconnect_interval_var.get())
+        )
         self.access_text.delete("1.0", "end")
         self.access_text.insert("1.0", data.get("access_rules", ""))
 
@@ -1602,13 +2176,26 @@ class SerialRelayApp(tk.Tk):
         path = settings_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(self._settings_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
+        set_startup_registration(self.start_with_windows_var.get())
 
     def _on_close(self) -> None:
-        if self.running:
+        if not self._allow_exit and self.close_to_tray_var.get():
+            self._save_settings()
+            self._hide_to_tray()
+            return
+
+        if self.running and not self._allow_exit:
             if not messagebox.askyesno(APP_NAME, "服务正在运行，是否停止并退出？"):
                 return
+        if self.running:
             self._stop()
         self._save_settings()
+        if self.tray_icon is not None:
+            try:
+                self.tray_icon.stop()
+            except Exception:
+                pass
+        self.log_store.close()
         self.destroy()
 
 
@@ -1655,6 +2242,24 @@ def format_runtime_error(exc: Exception, settings: RelaySettings) -> str:
             f"{owner_text}请关闭占用程序，或改用其它本地端口。"
         )
     return f"运行失败: {exc}"
+
+
+def settings_summary(settings: RelaySettings) -> str:
+    mode_label = NETWORK_MODE_LABELS.get(settings.network_mode, settings.network_mode)
+    serial_label = (
+        f"{settings.serial.port} {settings.serial.baudrate}-"
+        f"{settings.serial.data_bits}{settings.serial.parity}{settings.serial.stop_bits}"
+    )
+    if settings.network_mode in {"tcp_client", "udp_client"}:
+        network_label = f"{mode_label} -> {settings.remote_host}:{settings.remote_port}"
+        if settings.local_port > 0 or settings.bind_host != BIND_ALL_VALUE:
+            network_label += f"，本地 {bind_host_display(settings.bind_host)}:{settings.local_port}"
+    else:
+        network_label = f"{mode_label} {bind_host_display(settings.bind_host)}:{settings.local_port}"
+    access_label = ACCESS_MODE_LABELS.get(settings.access_mode, settings.access_mode)
+    client_label = CLIENT_POLICY_LABELS.get(settings.client_policy, settings.client_policy)
+    reconnect_label = "串口重连开" if settings.serial.auto_reconnect else "串口重连关"
+    return f"{serial_label}，{network_label}，{client_label}，{access_label}，{reconnect_label}"
 
 
 def is_address_in_use(exc: OSError) -> bool:
@@ -1717,10 +2322,17 @@ def split_rules(text: str) -> list[str]:
 
 
 def settings_path() -> Path:
-    base = os.environ.get("APPDATA")
-    if base:
-        return Path(base) / APP_DIR_NAME / "settings.json"
-    return Path.home() / f".{APP_DIR_NAME}" / "settings.json"
+    return app_root() / SETTINGS_FILE_NAME
+
+
+def log_dir_path() -> Path:
+    return app_root() / LOG_DIR_NAME
+
+
+def app_root() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
 
 
 def resource_path(relative_path: Path) -> Path:
@@ -1738,6 +2350,63 @@ def format_bytes_count(value: int) -> str:
     return f"{value / 1024 / 1024:.1f} MB"
 
 
+def parse_log_time(text: str, is_end: bool) -> float | None:
+    value = text.strip()
+    if not value:
+        return None
+
+    formats = (
+        ("%Y-%m-%d %H:%M:%S", False),
+        ("%Y-%m-%d %H:%M", False),
+        ("%Y-%m-%d", True),
+    )
+    for fmt, date_only in formats:
+        try:
+            parsed = dt.datetime.strptime(value, fmt)
+        except ValueError:
+            continue
+        if date_only and is_end:
+            parsed = parsed.replace(hour=23, minute=59, second=59)
+        return parsed.timestamp()
+
+    raise ValueError("时间格式应为 YYYY-MM-DD 或 YYYY-MM-DD HH:MM:SS。")
+
+
+def truncate_text(text: str, limit: int) -> str:
+    single_line = " ".join(text.splitlines())
+    if len(single_line) <= limit:
+        return single_line
+    return single_line[: limit - 1] + "..."
+
+
+def clean_tsv(value: object) -> str:
+    return str(value).replace("\t", " ").replace("\r", " ").replace("\n", " ")
+
+
+def set_startup_registration(enabled: bool) -> None:
+    if os.name != "nt":
+        return
+    try:
+        import winreg
+
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, WINDOWS_RUN_KEY, 0, winreg.KEY_SET_VALUE) as key:
+            if enabled:
+                winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ, startup_command())
+            else:
+                try:
+                    winreg.DeleteValue(key, APP_NAME)
+                except FileNotFoundError:
+                    pass
+    except OSError:
+        pass
+
+
+def startup_command() -> str:
+    if getattr(sys, "frozen", False):
+        return f'"{sys.executable}" --minimized'
+    return f'"{sys.executable}" "{Path(__file__).resolve()}" --minimized'
+
+
 def safe_close(resource: object) -> None:
     try:
         close = getattr(resource, "close")
@@ -1746,9 +2415,40 @@ def safe_close(resource: object) -> None:
         pass
 
 
+_INSTANCE_MUTEX: int | None = None
+
+
+def ensure_single_instance() -> bool:
+    global _INSTANCE_MUTEX
+    if os.name != "nt":
+        return True
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    mutex = kernel32.CreateMutexW(None, False, f"Local\\{APP_NAME}")
+    if not mutex:
+        return True
+    if ctypes.get_last_error() == 183:
+        ctypes.windll.user32.MessageBoxW(None, f"{APP_NAME} 已在运行。", APP_NAME, 0x40)
+        kernel32.CloseHandle(mutex)
+        return False
+    _INSTANCE_MUTEX = mutex
+    return True
+
+
+def release_single_instance() -> None:
+    global _INSTANCE_MUTEX
+    if os.name == "nt" and _INSTANCE_MUTEX:
+        ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle(_INSTANCE_MUTEX)
+        _INSTANCE_MUTEX = None
+
+
 def main() -> int:
-    app = SerialRelayApp()
-    app.mainloop()
+    if not ensure_single_instance():
+        return 0
+    try:
+        app = SerialRelayApp(start_minimized="--minimized" in sys.argv)
+        app.mainloop()
+    finally:
+        release_single_instance()
     return 0
 
 
