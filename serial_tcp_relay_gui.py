@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import calendar
 import datetime as dt
 import ctypes
 import fnmatch
@@ -366,6 +367,172 @@ class LogStore:
             self._system_conn.commit()
 
 
+class DateTimePicker(tk.Toplevel):
+    def __init__(self, master: tk.Tk, title: str, target_var: tk.StringVar, is_end: bool) -> None:
+        super().__init__(master)
+        self.target_var = target_var
+        self.is_end = is_end
+        self.calendar = calendar.Calendar(firstweekday=0)
+        self.day_buttons: list[tk.Button] = []
+
+        initial = self._initial_datetime()
+        self.selected_date = initial.date()
+        self.visible_year = initial.year
+        self.visible_month = initial.month
+        self.hour_var = tk.StringVar(value=f"{initial.hour:02d}")
+        self.minute_var = tk.StringVar(value=f"{initial.minute:02d}")
+        self.second_var = tk.StringVar(value=f"{initial.second:02d}")
+
+        self.title(title)
+        self.resizable(False, False)
+        self.transient(master)
+        self.grab_set()
+        self._build_ui()
+        self._render_calendar()
+        self.focus_force()
+
+    def _initial_datetime(self) -> dt.datetime:
+        try:
+            parsed = parse_log_datetime(self.target_var.get(), self.is_end)
+        except ValueError:
+            parsed = None
+        if parsed is not None:
+            return parsed
+
+        now = dt.datetime.now().replace(microsecond=0)
+        if self.is_end:
+            return now.replace(hour=23, minute=59, second=59)
+        return now.replace(hour=0, minute=0, second=0)
+
+    def _build_ui(self) -> None:
+        container = ttk.Frame(self, padding=10)
+        container.grid(row=0, column=0, sticky="nsew")
+
+        header = ttk.Frame(container)
+        header.grid(row=0, column=0, columnspan=7, sticky="ew")
+        header.columnconfigure(1, weight=1)
+        ttk.Button(header, text="<", width=4, command=self._previous_month).grid(row=0, column=0, sticky="w")
+        self.month_label = ttk.Label(header, anchor="center")
+        self.month_label.grid(row=0, column=1, sticky="ew", padx=8)
+        ttk.Button(header, text=">", width=4, command=self._next_month).grid(row=0, column=2, sticky="e")
+
+        for column, text in enumerate(("一", "二", "三", "四", "五", "六", "日")):
+            ttk.Label(container, text=text, anchor="center").grid(row=1, column=column, sticky="ew", pady=(8, 2))
+
+        for row in range(6):
+            for column in range(7):
+                button = tk.Button(container, width=4, relief="flat", command=lambda: None)
+                button.grid(row=row + 2, column=column, padx=1, pady=1)
+                self.day_buttons.append(button)
+
+        time_frame = ttk.Frame(container)
+        time_frame.grid(row=8, column=0, columnspan=7, sticky="ew", pady=(10, 0))
+        ttk.Label(time_frame, text="时间").grid(row=0, column=0, sticky="w")
+        values_24 = tuple(f"{value:02d}" for value in range(24))
+        values_60 = tuple(f"{value:02d}" for value in range(60))
+        ttk.Combobox(time_frame, textvariable=self.hour_var, values=values_24, width=4, state="readonly").grid(
+            row=0, column=1, padx=(8, 2)
+        )
+        ttk.Label(time_frame, text=":").grid(row=0, column=2)
+        ttk.Combobox(time_frame, textvariable=self.minute_var, values=values_60, width=4, state="readonly").grid(
+            row=0, column=3, padx=2
+        )
+        ttk.Label(time_frame, text=":").grid(row=0, column=4)
+        ttk.Combobox(time_frame, textvariable=self.second_var, values=values_60, width=4, state="readonly").grid(
+            row=0, column=5, padx=2
+        )
+
+        actions = ttk.Frame(container)
+        actions.grid(row=9, column=0, columnspan=7, sticky="ew", pady=(10, 0))
+        ttk.Button(actions, text="今天", command=self._select_today).grid(row=0, column=0)
+        ttk.Button(actions, text="清空", command=self._clear).grid(row=0, column=1, padx=(8, 0))
+        ttk.Button(actions, text="确定", command=self._apply).grid(row=0, column=2, padx=(18, 0))
+        ttk.Button(actions, text="取消", command=self.destroy).grid(row=0, column=3, padx=(8, 0))
+
+    def _render_calendar(self) -> None:
+        self.month_label.configure(text=f"{self.visible_year}年 {self.visible_month:02d}月")
+        weeks = self.calendar.monthdatescalendar(self.visible_year, self.visible_month)
+        while len(weeks) < 6:
+            start = weeks[-1][-1] + dt.timedelta(days=1)
+            weeks.append([start + dt.timedelta(days=offset) for offset in range(7)])
+
+        today = dt.date.today()
+        for button, day in zip(self.day_buttons, [day for week in weeks for day in week]):
+            if day.month != self.visible_month:
+                bg = "SystemButtonFace"
+                fg = "#9ca3af"
+            elif day == self.selected_date:
+                bg = "#2563eb"
+                fg = "white"
+            elif day == today:
+                bg = "#dbeafe"
+                fg = "#111827"
+            else:
+                bg = "SystemButtonFace"
+                fg = "#111827"
+            button.configure(
+                text=str(day.day),
+                background=bg,
+                foreground=fg,
+                activebackground=bg,
+                activeforeground=fg,
+                command=lambda value=day: self._select_date(value),
+            )
+
+    def _select_date(self, value: dt.date) -> None:
+        self.selected_date = value
+        self.visible_year = value.year
+        self.visible_month = value.month
+        self._render_calendar()
+
+    def _previous_month(self) -> None:
+        if self.visible_month == 1:
+            self.visible_year -= 1
+            self.visible_month = 12
+        else:
+            self.visible_month -= 1
+        self._render_calendar()
+
+    def _next_month(self) -> None:
+        if self.visible_month == 12:
+            self.visible_year += 1
+            self.visible_month = 1
+        else:
+            self.visible_month += 1
+        self._render_calendar()
+
+    def _select_today(self) -> None:
+        today = dt.date.today()
+        self.selected_date = today
+        self.visible_year = today.year
+        self.visible_month = today.month
+        if self.is_end:
+            self.hour_var.set("23")
+            self.minute_var.set("59")
+            self.second_var.set("59")
+        else:
+            self.hour_var.set("00")
+            self.minute_var.set("00")
+            self.second_var.set("00")
+        self._render_calendar()
+
+    def _clear(self) -> None:
+        self.target_var.set("")
+        self.destroy()
+
+    def _apply(self) -> None:
+        value = dt.datetime(
+            self.selected_date.year,
+            self.selected_date.month,
+            self.selected_date.day,
+            int(self.hour_var.get()),
+            int(self.minute_var.get()),
+            int(self.second_var.get()),
+        )
+        self.target_var.set(value.strftime("%Y-%m-%d %H:%M:%S"))
+        self.destroy()
+
+
 class LogViewer(tk.Toplevel):
     def __init__(self, master: tk.Tk, log_store: LogStore) -> None:
         super().__init__(master)
@@ -418,13 +585,23 @@ class LogViewer(tk.Toplevel):
         keyword_entry.bind("<Return>", lambda _event: self._refresh())
 
         ttk.Label(filters, text="开始").grid(row=1, column=0, sticky="w", pady=(8, 0))
-        ttk.Entry(filters, textvariable=self.start_time_var, width=19).grid(
-            row=1, column=1, sticky="w", padx=(6, 14), pady=(8, 0)
-        )
+        start_picker = ttk.Frame(filters)
+        start_picker.grid(row=1, column=1, sticky="w", padx=(6, 14), pady=(8, 0))
+        ttk.Entry(start_picker, textvariable=self.start_time_var, width=19, state="readonly").grid(row=0, column=0)
+        ttk.Button(
+            start_picker,
+            text="选择",
+            command=lambda: self._open_time_picker(self.start_time_var, False, "选择开始时间"),
+        ).grid(row=0, column=1, padx=(6, 0))
         ttk.Label(filters, text="结束").grid(row=1, column=2, sticky="w", pady=(8, 0))
-        ttk.Entry(filters, textvariable=self.end_time_var, width=19).grid(
-            row=1, column=3, sticky="w", padx=(6, 14), pady=(8, 0)
-        )
+        end_picker = ttk.Frame(filters)
+        end_picker.grid(row=1, column=3, sticky="w", padx=(6, 14), pady=(8, 0))
+        ttk.Entry(end_picker, textvariable=self.end_time_var, width=19, state="readonly").grid(row=0, column=0)
+        ttk.Button(
+            end_picker,
+            text="选择",
+            command=lambda: self._open_time_picker(self.end_time_var, True, "选择结束时间"),
+        ).grid(row=0, column=1, padx=(6, 0))
 
         actions = ttk.Frame(filters)
         actions.grid(row=2, column=0, columnspan=6, sticky="ew", pady=(8, 0))
@@ -468,6 +645,9 @@ class LogViewer(tk.Toplevel):
 
         self.detail_text = tk.Text(body, height=5, wrap="word", state="disabled")
         self.detail_text.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+
+    def _open_time_picker(self, target_var: tk.StringVar, is_end: bool, title: str) -> None:
+        DateTimePicker(self, title, target_var, is_end)
 
     def _refresh(self) -> None:
         try:
@@ -2384,6 +2564,11 @@ def format_bytes_count(value: int) -> str:
 
 
 def parse_log_time(text: str, is_end: bool) -> float | None:
+    parsed = parse_log_datetime(text, is_end)
+    return parsed.timestamp() if parsed is not None else None
+
+
+def parse_log_datetime(text: str, is_end: bool) -> dt.datetime | None:
     value = text.strip()
     if not value:
         return None
@@ -2400,7 +2585,7 @@ def parse_log_time(text: str, is_end: bool) -> float | None:
             continue
         if date_only and is_end:
             parsed = parsed.replace(hour=23, minute=59, second=59)
-        return parsed.timestamp()
+        return parsed
 
     raise ValueError("时间格式应为 YYYY-MM-DD 或 YYYY-MM-DD HH:MM:SS。")
 
