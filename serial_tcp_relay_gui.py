@@ -31,6 +31,7 @@ from serial.tools import list_ports
 
 APP_NAME = "本地串口网络中继"
 APP_VERSION = "1.0.0"
+APP_TITLE = f"{APP_NAME} v{APP_VERSION}"
 APP_DIR_NAME = "SerialTcpRelay"
 APP_ICON_PATH = Path("img") / "app.png"
 BIND_ALL_VALUE = "0.0.0.0"
@@ -1663,7 +1664,7 @@ class SerialNetworkRelay:
 class SerialRelayApp(tk.Tk):
     def __init__(self, start_minimized: bool = False) -> None:
         super().__init__()
-        self.title(APP_NAME)
+        self.title(APP_TITLE)
         self._set_window_icon()
         self.minsize(980, 680)
 
@@ -1682,7 +1683,7 @@ class SerialRelayApp(tk.Tk):
         self._refresh_bind_hosts()
         self._update_network_mode_state()
         self._create_tray_icon()
-        self._append_log("INFO", f"{APP_NAME} v{APP_VERSION} 已启动，程序目录: {app_root()}")
+        self._append_log("INFO", f"{APP_TITLE} 已启动，程序目录: {app_root()}")
         if self.auto_start_service_var.get():
             self.after(700, self._start)
         if self._start_minimized:
