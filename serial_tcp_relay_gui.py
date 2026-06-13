@@ -24,7 +24,7 @@ import serial
 from serial.tools import list_ports
 
 
-APP_NAME = "本地串口网络透传工具"
+APP_NAME = "本地串口网络中继"
 APP_DIR_NAME = "SerialTcpRelay"
 APP_ICON_PATH = Path("img") / "app.png"
 BIND_ALL_VALUE = "0.0.0.0"

@@ -35,5 +35,23 @@ python -m PyInstaller `
   .\serial_tcp_relay_gui.py
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+$sourceExe = ".\dist\SerialTcpRelay.exe"
+$targetName = [string]::Concat(
+  [char]0x672C,
+  [char]0x5730,
+  [char]0x4E32,
+  [char]0x53E3,
+  [char]0x7F51,
+  [char]0x7EDC,
+  [char]0x4E2D,
+  [char]0x7EE7,
+  ".exe"
+)
+$targetExe = Join-Path ".\dist" $targetName
+if (Test-Path $targetExe) {
+  Remove-Item -LiteralPath $targetExe -Force
+}
+Move-Item -LiteralPath $sourceExe -Destination $targetExe -Force
+
 Write-Host ""
-Write-Host "Build complete: $((Resolve-Path .\dist\SerialTcpRelay.exe).Path)"
+Write-Host "Build complete: $((Resolve-Path $targetExe).Path)"

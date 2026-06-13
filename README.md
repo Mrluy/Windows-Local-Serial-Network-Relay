@@ -32,7 +32,7 @@ GUI 支持：
 生成文件：
 
 ```text
-dist\SerialTcpRelay.exe
+dist\本地串口网络中继.exe
 ```
 
 这个 EXE 已包含 Python 运行时和串口依赖，目标电脑无需安装 Python 或其它依赖。首次监听局域网端口时，Windows 可能弹出防火墙授权提示，请允许专用网络访问。
