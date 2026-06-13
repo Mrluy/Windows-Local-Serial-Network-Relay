@@ -205,12 +205,20 @@ class LogStore:
             self._data_conn.commit()
             self._prune_data_locked(created_at)
 
-    def query(self, log_type: str, keyword: str, start_ts: float | None, end_ts: float | None, limit: int = 1000) -> list[dict[str, Any]]:
+    def query(
+        self,
+        log_type: str,
+        level_filter: str,
+        keyword: str,
+        start_ts: float | None,
+        end_ts: float | None,
+        limit: int = 1000,
+    ) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
         if log_type in {"全部", "运行日志", "连接记录"}:
-            rows.extend(self._query_system(log_type, keyword, start_ts, end_ts, limit))
+            rows.extend(self._query_system(log_type, level_filter, keyword, start_ts, end_ts, limit))
         if log_type in {"全部", "数据收发"}:
-            rows.extend(self._query_data(keyword, start_ts, end_ts, limit))
+            rows.extend(self._query_data(level_filter, keyword, start_ts, end_ts, limit))
         rows.sort(key=lambda item: item["created_at"], reverse=True)
         return rows[:limit]
 
@@ -257,6 +265,7 @@ class LogStore:
     def _query_system(
         self,
         log_type: str,
+        level_filter: str,
         keyword: str,
         start_ts: float | None,
         end_ts: float | None,
@@ -267,6 +276,9 @@ class LogStore:
         if log_type in {"运行日志", "连接记录"}:
             sql += " AND category = ?"
             params.append(log_type)
+        if level_filter:
+            sql += " AND level LIKE ?"
+            params.append(f"%{level_filter}%")
         if start_ts is not None:
             sql += " AND created_at >= ?"
             params.append(start_ts)
@@ -296,6 +308,7 @@ class LogStore:
 
     def _query_data(
         self,
+        level_filter: str,
         keyword: str,
         start_ts: float | None,
         end_ts: float | None,
@@ -303,6 +316,9 @@ class LogStore:
     ) -> list[dict[str, Any]]:
         sql = "SELECT created_at, time_text, peer, direction, byte_count, hex_data FROM data_logs WHERE 1=1"
         params: list[Any] = []
+        if level_filter:
+            sql += " AND direction LIKE ?"
+            params.append(f"%{level_filter}%")
         if start_ts is not None:
             sql += " AND created_at >= ?"
             params.append(start_ts)
@@ -361,6 +377,7 @@ class LogViewer(tk.Toplevel):
         self.transient(master)
 
         self.log_type_var = tk.StringVar(value="全部")
+        self.level_filter_var = tk.StringVar(value="")
         self.keyword_var = tk.StringVar(value="")
         self.start_time_var = tk.StringVar(value="")
         self.end_time_var = tk.StringVar(value="")
@@ -374,7 +391,7 @@ class LogViewer(tk.Toplevel):
 
         filters = ttk.Frame(self, padding=(10, 10, 10, 6))
         filters.grid(row=0, column=0, sticky="ew")
-        filters.columnconfigure(3, weight=1)
+        filters.columnconfigure(5, weight=1)
 
         ttk.Label(filters, text="类型").grid(row=0, column=0, sticky="w")
         ttk.Combobox(
@@ -385,18 +402,32 @@ class LogViewer(tk.Toplevel):
             width=12,
         ).grid(row=0, column=1, sticky="w", padx=(6, 14))
 
-        ttk.Label(filters, text="关键字").grid(row=0, column=2, sticky="w")
+        ttk.Label(filters, text="等级/方向").grid(row=0, column=2, sticky="w")
+        level_combo = ttk.Combobox(
+            filters,
+            textvariable=self.level_filter_var,
+            values=("INFO", "WARN", "ERROR", "已连接", "已断开", "已拒绝", "网络->串口", "串口->网络"),
+            width=12,
+        )
+        level_combo.grid(row=0, column=3, sticky="w", padx=(6, 14))
+        level_combo.bind("<Return>", lambda _event: self._refresh())
+
+        ttk.Label(filters, text="关键字").grid(row=0, column=4, sticky="w")
         keyword_entry = ttk.Entry(filters, textvariable=self.keyword_var)
-        keyword_entry.grid(row=0, column=3, sticky="ew", padx=(6, 14))
+        keyword_entry.grid(row=0, column=5, sticky="ew", padx=(6, 14))
         keyword_entry.bind("<Return>", lambda _event: self._refresh())
 
-        ttk.Label(filters, text="开始").grid(row=0, column=4, sticky="w")
-        ttk.Entry(filters, textvariable=self.start_time_var, width=19).grid(row=0, column=5, sticky="w", padx=(6, 14))
-        ttk.Label(filters, text="结束").grid(row=0, column=6, sticky="w")
-        ttk.Entry(filters, textvariable=self.end_time_var, width=19).grid(row=0, column=7, sticky="w", padx=(6, 0))
+        ttk.Label(filters, text="开始").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(filters, textvariable=self.start_time_var, width=19).grid(
+            row=1, column=1, sticky="w", padx=(6, 14), pady=(8, 0)
+        )
+        ttk.Label(filters, text="结束").grid(row=1, column=2, sticky="w", pady=(8, 0))
+        ttk.Entry(filters, textvariable=self.end_time_var, width=19).grid(
+            row=1, column=3, sticky="w", padx=(6, 14), pady=(8, 0)
+        )
 
         actions = ttk.Frame(filters)
-        actions.grid(row=1, column=0, columnspan=8, sticky="ew", pady=(8, 0))
+        actions.grid(row=2, column=0, columnspan=6, sticky="ew", pady=(8, 0))
         ttk.Button(actions, text="查询", command=self._refresh).grid(row=0, column=0)
         ttk.Button(actions, text="最近24小时", command=self._set_recent_day).grid(row=0, column=1, padx=(8, 0))
         ttk.Button(actions, text="清空条件", command=self._clear_filters).grid(row=0, column=2, padx=(8, 0))
@@ -452,6 +483,7 @@ class LogViewer(tk.Toplevel):
 
         self.rows = self.log_store.query(
             self.log_type_var.get(),
+            self.level_filter_var.get().strip(),
             self.keyword_var.get().strip(),
             start_ts,
             end_ts,
@@ -485,6 +517,7 @@ class LogViewer(tk.Toplevel):
 
     def _clear_filters(self) -> None:
         self.log_type_var.set("全部")
+        self.level_filter_var.set("")
         self.keyword_var.set("")
         self.start_time_var.set("")
         self.end_time_var.set("")
