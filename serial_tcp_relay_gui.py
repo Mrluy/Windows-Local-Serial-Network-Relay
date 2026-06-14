@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import calendar
+import base64
 import datetime as dt
 import ctypes
 import fnmatch
@@ -30,7 +31,7 @@ from serial.tools import list_ports
 
 
 APP_NAME = "本地串口网络中继"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 APP_TITLE = f"{APP_NAME} v{APP_VERSION}"
 APP_DIR_NAME = "SerialTcpRelay"
 APP_ICON_PATH = Path("img") / "app.png"
@@ -79,6 +80,8 @@ class SerialSettings:
     reset_input: bool
     auto_reconnect: bool
     reconnect_interval: float
+    restart_device_on_timeout: bool
+    restart_device_after: float
 
 
 @dataclass(frozen=True)
@@ -1079,6 +1082,8 @@ class SerialNetworkRelay:
         self._serial_write_lock = threading.RLock()
         self._serial_reconnect_lock = threading.Lock()
         self._serial_reconnect_thread: threading.Thread | None = None
+        self._serial_reconnect_started_at: float | None = None
+        self._last_serial_device_restart_at = 0.0
         self._last_serial_drop_log = 0.0
         self._clients_lock = threading.Lock()
         self._clients: dict[Any, ClientSession] = {}
@@ -1519,6 +1524,8 @@ class SerialNetworkRelay:
         with self._serial_reconnect_lock:
             if self._serial is not None:
                 return
+            if self._serial_reconnect_started_at is None:
+                self._serial_reconnect_started_at = time.monotonic()
             if self._serial_reconnect_thread is not None and self._serial_reconnect_thread.is_alive():
                 return
             self._serial_reconnect_thread = threading.Thread(
@@ -1541,6 +1548,7 @@ class SerialNetworkRelay:
                     "WARN",
                     f"串口重连失败: {exc}。{self.settings.serial.reconnect_interval:g} 秒后重试。",
                 )
+                self._maybe_restart_serial_device()
                 self._stop_event.wait(self.settings.serial.reconnect_interval)
                 continue
 
@@ -1553,10 +1561,43 @@ class SerialNetworkRelay:
                 return
 
             self._log("INFO", f"串口已重新连接 {self._serial_label()}")
+            self._serial_reconnect_started_at = None
+            self._last_serial_device_restart_at = 0.0
             self._emit_serial_status("串口: 在线")
             self._emit_status(True, "运行中")
             self._notify("串口已重新连接", self._serial_label())
             return
+
+    def _maybe_restart_serial_device(self) -> None:
+        serial_settings = self.settings.serial
+        if not serial_settings.restart_device_on_timeout:
+            return
+
+        started_at = self._serial_reconnect_started_at
+        if started_at is None:
+            return
+
+        now = time.monotonic()
+        elapsed = now - started_at
+        if elapsed < serial_settings.restart_device_after:
+            return
+        if (
+            self._last_serial_device_restart_at
+            and now - self._last_serial_device_restart_at < serial_settings.restart_device_after
+        ):
+            return
+
+        self._last_serial_device_restart_at = now
+        self._log(
+            "WARN",
+            f"串口 {serial_settings.port} 已连续重连 {elapsed:.0f} 秒未恢复，尝试重启对应 PnP 设备。",
+        )
+        ok, message = restart_serial_pnp_device(serial_settings.port)
+        if ok:
+            self._log("INFO", message)
+            self._notify("串口设备已重启", message)
+        else:
+            self._log("ERROR", f"自动重启串口设备失败: {message}")
 
     def _broadcast(self, data: bytes) -> None:
         with self._clients_lock:
@@ -1712,6 +1753,8 @@ class SerialRelayApp(tk.Tk):
         self.reset_input_var = tk.BooleanVar(value=True)
         self.serial_auto_reconnect_var = tk.BooleanVar(value=True)
         self.serial_reconnect_interval_var = tk.StringVar(value="2")
+        self.serial_restart_device_var = tk.BooleanVar(value=True)
+        self.serial_restart_after_var = tk.StringVar(value="60")
 
         self.network_mode_var = tk.StringVar(value=NETWORK_MODE_LABELS["tcp_server"])
         self.bind_host_var = tk.StringVar(value=BIND_ALL_LABEL)
@@ -1819,6 +1862,16 @@ class SerialRelayApp(tk.Tk):
             values=("0.5", "1", "2", "3", "5", "10"),
             width=8,
         ).grid(row=3, column=1, sticky="w", padx=(8, 0), pady=(4, 0))
+        ttk.Checkbutton(checks, text="重连超时自动重启串口设备", variable=self.serial_restart_device_var).grid(
+            row=4, column=0, columnspan=2, sticky="w", pady=(4, 0)
+        )
+        ttk.Label(checks, text="超时阈值(秒)").grid(row=5, column=0, sticky="w", pady=(4, 0))
+        ttk.Combobox(
+            checks,
+            textvariable=self.serial_restart_after_var,
+            values=("30", "60", "90", "120", "180", "300"),
+            width=8,
+        ).grid(row=5, column=1, sticky="w", padx=(8, 0), pady=(4, 0))
         return frame
 
     def _build_network_frame(self, parent: ttk.Frame) -> ttk.LabelFrame:
@@ -2126,12 +2179,15 @@ class SerialRelayApp(tk.Tk):
             local_port = int(self.local_port_var.get())
             remote_port = int(self.remote_port_var.get())
             reconnect_interval = float(self.serial_reconnect_interval_var.get())
+            restart_device_after = float(self.serial_restart_after_var.get())
             network_reconnect_interval = float(self.network_reconnect_interval_var.get())
         except ValueError as exc:
-            raise ValueError("波特率、本地端口、目标端口和重连间隔必须是数字。") from exc
+            raise ValueError("波特率、本地端口、目标端口、重连间隔和超时阈值必须是数字。") from exc
 
         if reconnect_interval <= 0:
             raise ValueError("串口重连间隔必须大于 0 秒。")
+        if restart_device_after <= 0:
+            raise ValueError("串口设备重启超时阈值必须大于 0 秒。")
         if network_reconnect_interval <= 0:
             raise ValueError("网络重连间隔必须大于 0 秒。")
 
@@ -2157,6 +2213,8 @@ class SerialRelayApp(tk.Tk):
             reset_input=self.reset_input_var.get(),
             auto_reconnect=self.serial_auto_reconnect_var.get(),
             reconnect_interval=reconnect_interval,
+            restart_device_on_timeout=self.serial_restart_device_var.get(),
+            restart_device_after=restart_device_after,
         )
 
         access_rules = tuple(split_rules(self.access_text.get("1.0", "end")))
@@ -2320,6 +2378,8 @@ class SerialRelayApp(tk.Tk):
             "reset_input": self.reset_input_var.get(),
             "serial_auto_reconnect": self.serial_auto_reconnect_var.get(),
             "serial_reconnect_interval": self.serial_reconnect_interval_var.get(),
+            "serial_restart_device": self.serial_restart_device_var.get(),
+            "serial_restart_after": self.serial_restart_after_var.get(),
             "network_mode": self.network_mode_var.get(),
             "bind_host": bind_host_value(self.bind_host_var.get()),
             "local_port": self.local_port_var.get(),
@@ -2361,6 +2421,8 @@ class SerialRelayApp(tk.Tk):
         self.serial_reconnect_interval_var.set(
             data.get("serial_reconnect_interval", self.serial_reconnect_interval_var.get())
         )
+        self.serial_restart_device_var.set(bool(data.get("serial_restart_device", self.serial_restart_device_var.get())))
+        self.serial_restart_after_var.set(data.get("serial_restart_after", self.serial_restart_after_var.get()))
 
         network_mode = data.get("network_mode", self.network_mode_var.get())
         if network_mode not in NETWORK_MODES:
@@ -2473,7 +2535,12 @@ def settings_summary(settings: RelaySettings) -> str:
     access_label = ACCESS_MODE_LABELS.get(settings.access_mode, settings.access_mode)
     client_label = CLIENT_POLICY_LABELS.get(settings.client_policy, settings.client_policy)
     reconnect_label = "串口重连开" if settings.serial.auto_reconnect else "串口重连关"
-    return f"{serial_label}，{network_label}，{client_label}，{access_label}，{reconnect_label}"
+    restart_label = (
+        f"重连超时{settings.serial.restart_device_after:g}秒重启设备"
+        if settings.serial.restart_device_on_timeout
+        else "重连超时不重启设备"
+    )
+    return f"{serial_label}，{network_label}，{client_label}，{access_label}，{reconnect_label}，{restart_label}"
 
 
 def is_address_in_use(exc: OSError) -> bool:
@@ -2515,6 +2582,113 @@ if ($ownerPid) {{
     if result.returncode != 0:
         return ""
     return result.stdout.strip().splitlines()[0] if result.stdout.strip() else ""
+
+
+def restart_serial_pnp_device(port_name: str) -> tuple[bool, str]:
+    if os.name != "nt":
+        return False, "自动重启串口设备仅支持 Windows。"
+    if not is_windows_admin():
+        return False, "必须以管理员权限运行本软件，才能禁用/启用 PnP 串口设备。"
+
+    script = r"""
+$ErrorActionPreference = "Stop"
+$PortName = $env:SERIAL_RELAY_PORT
+
+function Get-ActionErrorMessage {
+    param([Parameter(Mandatory=$true)] [System.Management.Automation.ErrorRecord]$ErrorRecord)
+    if ($ErrorRecord.Exception.Message -match "Access is denied|拒绝访问") {
+        return "拒绝访问，设备可能正在被其它程序占用。"
+    }
+    return $ErrorRecord.Exception.Message
+}
+
+function Invoke-DeviceAction {
+    param(
+        [Parameter(Mandatory=$true)]
+        [ValidateSet("Disable", "Enable")]
+        [string]$Name,
+
+        [Parameter(Mandatory=$true)]
+        [string]$InstanceId
+    )
+
+    switch ($Name) {
+        "Disable" { Disable-PnpDevice -InstanceId $InstanceId -Confirm:$false -ErrorAction Stop | Out-Null }
+        "Enable" { Enable-PnpDevice -InstanceId $InstanceId -Confirm:$false -ErrorAction Stop | Out-Null }
+    }
+}
+
+$pattern = "*($PortName)"
+$pnpDevices = @(Get-PnpDevice -Class Ports -ErrorAction SilentlyContinue | Where-Object { $_.FriendlyName -like $pattern })
+if (-not $pnpDevices) {
+    $pnpDevices = @(Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object { $_.FriendlyName -like $pattern })
+}
+
+if (-not $pnpDevices) {
+    Write-Output "未找到包含 $PortName 的串口 PnP 设备。"
+    exit 3
+}
+
+if ($pnpDevices.Count -gt 1) {
+    Write-Output "找到多个匹配 $PortName 的 PnP 设备，请检查设备管理器中的串口名称。"
+    $pnpDevices | ForEach-Object { Write-Output " - $($_.FriendlyName) [$($_.InstanceId)]" }
+    exit 4
+}
+
+$pnpDevice = $pnpDevices[0]
+
+try {
+    Invoke-DeviceAction -Name "Disable" -InstanceId $pnpDevice.InstanceId
+}
+catch {
+    Write-Output "禁用失败: $(Get-ActionErrorMessage -ErrorRecord $_)"
+    exit 5
+}
+
+Start-Sleep -Seconds 2
+
+try {
+    Invoke-DeviceAction -Name "Enable" -InstanceId $pnpDevice.InstanceId
+}
+catch {
+    Write-Output "启用失败: $(Get-ActionErrorMessage -ErrorRecord $_)"
+    exit 6
+}
+
+Write-Output "设备已完成重启: $($pnpDevice.FriendlyName)"
+"""
+    encoded_script = base64.b64encode(script.encode("utf-16le")).decode("ascii")
+    env = os.environ.copy()
+    env["SERIAL_RELAY_PORT"] = port_name
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded_script],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=env,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except FileNotFoundError:
+        return False, "未找到 powershell，无法重启串口设备。"
+    except subprocess.TimeoutExpired:
+        return False, "重启串口设备超时。"
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, str(exc)
+
+    output = "\n".join(part.strip() for part in (result.stdout, result.stderr) if part.strip())
+    if result.returncode == 0:
+        return True, output or f"设备已完成重启: {port_name}"
+    return False, output or f"PowerShell 返回码 {result.returncode}"
+
+
+def is_windows_admin() -> bool:
+    if os.name != "nt":
+        return False
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
 
 
 def bind_host_display(value: str) -> str:
