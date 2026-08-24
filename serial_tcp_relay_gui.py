@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import calendar
 import base64
 import datetime as dt
@@ -31,7 +32,7 @@ from serial.tools import list_ports
 
 
 APP_NAME = "本地串口网络中继"
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.0.2"
 APP_TITLE = f"{APP_NAME} v{APP_VERSION}"
 APP_DIR_NAME = "SerialTcpRelay"
 APP_ICON_PATH = Path("img") / "app.png"
@@ -44,6 +45,7 @@ DATA_LOG_DB_NAME = "data_logs.sqlite"
 WINDOWS_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 SERIAL_READ_SIZE = 4096
 TCP_READ_SIZE = 4096
+WINDOWS_RESTART_DELAY_SECONDS = 5
 
 
 NETWORK_MODES = {
@@ -82,6 +84,10 @@ class SerialSettings:
     reconnect_interval: float
     restart_device_on_timeout: bool
     restart_device_after: float
+    restart_application_on_timeout: bool
+    restart_application_after: float
+    restart_system_on_timeout: bool
+    restart_system_after: float
 
 
 @dataclass(frozen=True)
@@ -98,6 +104,15 @@ class RelaySettings:
     hex_log: bool
     network_auto_reconnect: bool
     network_reconnect_interval: float
+
+
+@dataclass(frozen=True)
+class RuntimeOptions:
+    start_minimized: bool
+    force_start_service: bool
+    restart_wait_pid: int | None
+    inherited_outage_started_at: float | None
+    application_restart_already_done: bool
 
 
 @dataclass(eq=False)
@@ -1069,7 +1084,13 @@ class SerialTcpRelay:
 
 
 class SerialNetworkRelay:
-    def __init__(self, settings: RelaySettings, emit: Callable[[str, dict[str, Any]], None]) -> None:
+    def __init__(
+        self,
+        settings: RelaySettings,
+        emit: Callable[[str, dict[str, Any]], None],
+        inherited_outage_started_at: float | None = None,
+        application_restart_already_done: bool = False,
+    ) -> None:
         self.settings = settings
         self.emit = emit
 
@@ -1083,7 +1104,12 @@ class SerialNetworkRelay:
         self._serial_reconnect_lock = threading.Lock()
         self._serial_reconnect_thread: threading.Thread | None = None
         self._serial_reconnect_started_at: float | None = None
+        self._serial_outage_started_at = inherited_outage_started_at
         self._last_serial_device_restart_at = 0.0
+        self._timeout_action_lock = threading.Lock()
+        self._application_restart_requested = False
+        self._application_restart_completed = application_restart_already_done
+        self._system_restart_requested = False
         self._last_serial_drop_log = 0.0
         self._clients_lock = threading.Lock()
         self._clients: dict[Any, ClientSession] = {}
@@ -1108,6 +1134,7 @@ class SerialNetworkRelay:
             try:
                 self._serial = self._open_serial(self.settings.serial)
                 self._log("INFO", f"已打开串口 {self._serial_label()}")
+                self._reset_serial_recovery_state()
                 self._emit_serial_status("串口: 在线")
             except (OSError, serial.SerialException) as exc:
                 if not self.settings.serial.auto_reconnect:
@@ -1526,6 +1553,8 @@ class SerialNetworkRelay:
                 return
             if self._serial_reconnect_started_at is None:
                 self._serial_reconnect_started_at = time.monotonic()
+            if self._serial_outage_started_at is None:
+                self._serial_outage_started_at = time.time()
             if self._serial_reconnect_thread is not None and self._serial_reconnect_thread.is_alive():
                 return
             self._serial_reconnect_thread = threading.Thread(
@@ -1549,6 +1578,7 @@ class SerialNetworkRelay:
                     f"串口重连失败: {exc}。{self.settings.serial.reconnect_interval:g} 秒后重试。",
                 )
                 self._maybe_restart_serial_device()
+                self._maybe_request_serial_timeout_actions()
                 self._stop_event.wait(self.settings.serial.reconnect_interval)
                 continue
 
@@ -1561,24 +1591,39 @@ class SerialNetworkRelay:
                 return
 
             self._log("INFO", f"串口已重新连接 {self._serial_label()}")
-            self._serial_reconnect_started_at = None
-            self._last_serial_device_restart_at = 0.0
+            self._reset_serial_recovery_state()
             self._emit_serial_status("串口: 在线")
             self._emit_status(True, "运行中")
             self._notify("串口已重新连接", self._serial_label())
             return
+
+    def _serial_reconnect_elapsed(self) -> float:
+        elapsed = 0.0
+        if self._serial_reconnect_started_at is not None:
+            elapsed = max(elapsed, time.monotonic() - self._serial_reconnect_started_at)
+        if self._serial_outage_started_at is not None:
+            elapsed = max(elapsed, time.time() - self._serial_outage_started_at)
+        return max(0.0, elapsed)
+
+    def _reset_serial_recovery_state(self) -> None:
+        self._serial_reconnect_started_at = None
+        self._serial_outage_started_at = None
+        self._last_serial_device_restart_at = 0.0
+        with self._timeout_action_lock:
+            self._application_restart_requested = False
+            self._application_restart_completed = False
+            self._system_restart_requested = False
 
     def _maybe_restart_serial_device(self) -> None:
         serial_settings = self.settings.serial
         if not serial_settings.restart_device_on_timeout:
             return
 
-        started_at = self._serial_reconnect_started_at
-        if started_at is None:
+        if self._serial_reconnect_started_at is None:
             return
 
         now = time.monotonic()
-        elapsed = now - started_at
+        elapsed = self._serial_reconnect_elapsed()
         if elapsed < serial_settings.restart_device_after:
             return
         if (
@@ -1598,6 +1643,59 @@ class SerialNetworkRelay:
             self._notify("串口设备已重启", message)
         else:
             self._log("ERROR", f"自动重启串口设备失败: {message}")
+
+    def _maybe_request_serial_timeout_actions(self) -> None:
+        serial_settings = self.settings.serial
+        elapsed = self._serial_reconnect_elapsed()
+
+        with self._timeout_action_lock:
+            request_application_restart = (
+                serial_settings.restart_application_on_timeout
+                and not self._application_restart_requested
+                and not self._application_restart_completed
+                and elapsed >= serial_settings.restart_application_after
+            )
+            if request_application_restart:
+                self._application_restart_requested = True
+
+        if request_application_restart:
+            self._log(
+                "WARN",
+                f"串口 {serial_settings.port} 已连续重连 {elapsed:.0f} 秒未恢复，准备自动重启软件。",
+            )
+            self.emit(
+                "restart_application",
+                {
+                    "outage_started_at": self._serial_outage_started_at or time.time(),
+                    "elapsed": elapsed,
+                },
+            )
+            return
+
+        with self._timeout_action_lock:
+            if self._application_restart_requested:
+                return
+            request_system_restart = (
+                serial_settings.restart_system_on_timeout
+                and not self._system_restart_requested
+                and elapsed >= serial_settings.restart_system_after
+            )
+            if request_system_restart:
+                self._system_restart_requested = True
+
+        if request_system_restart:
+            self._log(
+                "WARN",
+                f"串口 {serial_settings.port} 已连续重连 {elapsed:.0f} 秒未恢复，准备自动重启 Windows。",
+            )
+            self.emit("restart_system", {"elapsed": elapsed})
+
+    def reset_timeout_action(self, action: str) -> None:
+        with self._timeout_action_lock:
+            if action == "application":
+                self._application_restart_requested = False
+            elif action == "system":
+                self._system_restart_requested = False
 
     def _broadcast(self, data: bytes) -> None:
         with self._clients_lock:
@@ -1703,7 +1801,13 @@ class SerialNetworkRelay:
 
 
 class SerialRelayApp(tk.Tk):
-    def __init__(self, start_minimized: bool = False) -> None:
+    def __init__(
+        self,
+        start_minimized: bool = False,
+        force_start_service: bool = False,
+        inherited_outage_started_at: float | None = None,
+        application_restart_already_done: bool = False,
+    ) -> None:
         super().__init__()
         self.title(APP_TITLE)
         self._set_window_icon()
@@ -1714,7 +1818,11 @@ class SerialRelayApp(tk.Tk):
         self.relay: SerialNetworkRelay | None = None
         self.running = False
         self._allow_exit = False
+        self._restart_in_progress = False
         self._start_minimized = start_minimized
+        self._force_start_service = force_start_service
+        self._inherited_outage_started_at = inherited_outage_started_at
+        self._application_restart_already_done = application_restart_already_done
         self.tray_icon: pystray.Icon | None = None
 
         self._build_variables()
@@ -1725,7 +1833,7 @@ class SerialRelayApp(tk.Tk):
         self._update_network_mode_state()
         self._create_tray_icon()
         self._append_log("INFO", f"{APP_TITLE} 已启动，程序目录: {app_root()}")
-        if self.auto_start_service_var.get():
+        if self._force_start_service or self.auto_start_service_var.get():
             self.after(700, self._start)
         if self._start_minimized:
             self.after(300, self._hide_to_tray)
@@ -1755,6 +1863,10 @@ class SerialRelayApp(tk.Tk):
         self.serial_reconnect_interval_var = tk.StringVar(value="2")
         self.serial_restart_device_var = tk.BooleanVar(value=True)
         self.serial_restart_after_var = tk.StringVar(value="60")
+        self.serial_restart_application_var = tk.BooleanVar(value=False)
+        self.serial_restart_application_after_var = tk.StringVar(value="300")
+        self.serial_restart_system_var = tk.BooleanVar(value=False)
+        self.serial_restart_system_after_var = tk.StringVar(value="900")
 
         self.network_mode_var = tk.StringVar(value=NETWORK_MODE_LABELS["tcp_server"])
         self.bind_host_var = tk.StringVar(value=BIND_ALL_LABEL)
@@ -1862,16 +1974,36 @@ class SerialRelayApp(tk.Tk):
             values=("0.5", "1", "2", "3", "5", "10"),
             width=8,
         ).grid(row=3, column=1, sticky="w", padx=(8, 0), pady=(4, 0))
-        ttk.Checkbutton(checks, text="重连超时自动重启串口设备", variable=self.serial_restart_device_var).grid(
-            row=4, column=0, columnspan=2, sticky="w", pady=(4, 0)
+        ttk.Checkbutton(checks, text="重连超时重启设备", variable=self.serial_restart_device_var).grid(
+            row=4, column=0, sticky="w", pady=(4, 0)
         )
-        ttk.Label(checks, text="超时阈值(秒)").grid(row=5, column=0, sticky="w", pady=(4, 0))
         ttk.Combobox(
             checks,
             textvariable=self.serial_restart_after_var,
             values=("30", "60", "90", "120", "180", "300"),
-            width=8,
-        ).grid(row=5, column=1, sticky="w", padx=(8, 0), pady=(4, 0))
+            width=5,
+        ).grid(row=4, column=1, sticky="w", padx=(6, 0), pady=(4, 0))
+        ttk.Label(checks, text="秒").grid(row=4, column=2, sticky="w", padx=(2, 0), pady=(4, 0))
+        ttk.Checkbutton(checks, text="重连超时重启软件", variable=self.serial_restart_application_var).grid(
+            row=5, column=0, sticky="w", pady=(4, 0)
+        )
+        ttk.Combobox(
+            checks,
+            textvariable=self.serial_restart_application_after_var,
+            values=("60", "120", "180", "300", "600", "900", "1800", "3600"),
+            width=5,
+        ).grid(row=5, column=1, sticky="w", padx=(6, 0), pady=(4, 0))
+        ttk.Label(checks, text="秒").grid(row=5, column=2, sticky="w", padx=(2, 0), pady=(4, 0))
+        ttk.Checkbutton(checks, text="重连超时重启系统", variable=self.serial_restart_system_var).grid(
+            row=6, column=0, sticky="w", pady=(4, 0)
+        )
+        ttk.Combobox(
+            checks,
+            textvariable=self.serial_restart_system_after_var,
+            values=("60", "120", "180", "300", "600", "900", "1800", "3600"),
+            width=5,
+        ).grid(row=6, column=1, sticky="w", padx=(6, 0), pady=(4, 0))
+        ttk.Label(checks, text="秒").grid(row=6, column=2, sticky="w", padx=(2, 0), pady=(4, 0))
         return frame
 
     def _build_network_frame(self, parent: ttk.Frame) -> ttk.LabelFrame:
@@ -1918,16 +2050,16 @@ class SerialRelayApp(tk.Tk):
         ttk.Checkbutton(options, text="十六进制日志", variable=self.hex_log_var).grid(row=0, column=0, sticky="w")
         ttk.Checkbutton(options, text="日志自动滚动", variable=self.autoscroll_var).grid(row=0, column=1, sticky="w", padx=(12, 0))
         ttk.Checkbutton(options, text="Client 自动重连", variable=self.network_auto_reconnect_var).grid(
-            row=1, column=0, sticky="w", pady=(6, 0)
+            row=1, column=0, columnspan=2, sticky="w", pady=(6, 0)
         )
-        ttk.Label(options, text="网络重连间隔(秒)").grid(row=1, column=1, sticky="w", padx=(12, 0), pady=(6, 0))
+        ttk.Label(options, text="网络重连间隔(秒)").grid(row=2, column=0, sticky="w", pady=(6, 0))
         ttk.Combobox(
             options,
             textvariable=self.network_reconnect_interval_var,
             values=("1", "2", "3", "5", "10", "30"),
             width=8,
-        ).grid(row=1, column=2, sticky="w", padx=(8, 0), pady=(6, 0))
-        ttk.Button(options, text="复制地址", command=self._copy_address).grid(row=2, column=0, sticky="w", pady=(8, 0))
+        ).grid(row=2, column=1, sticky="w", padx=(8, 0), pady=(6, 0))
+        ttk.Button(options, text="复制地址", command=self._copy_address).grid(row=3, column=0, sticky="w", pady=(8, 0))
         return frame
 
     def _build_policy_frame(self, parent: ttk.Frame) -> ttk.LabelFrame:
@@ -2045,11 +2177,12 @@ class SerialRelayApp(tk.Tk):
     def _refresh_ports(self) -> None:
         ports = list(list_ports.comports())
         values = [port.device for port in ports]
+        configured_port = self.serial_port_var.get().strip()
+        if configured_port and configured_port not in values:
+            values.insert(0, configured_port)
         self.port_combo.configure(values=values)
-        if values and self.serial_port_var.get() not in values:
+        if values and not configured_port:
             self.serial_port_var.set(values[0])
-        if not values:
-            self.serial_port_var.set("")
 
     def _refresh_bind_hosts(self) -> None:
         current = bind_host_value(self.bind_host_var.get())
@@ -2161,8 +2294,15 @@ class SerialRelayApp(tk.Tk):
         self._set_controls_running(True)
         self._append_log("INFO", "正在启动服务")
         self._append_log("INFO", f"版本: {APP_VERSION}; 启动参数: {settings_summary(settings)}")
-        self.relay = SerialNetworkRelay(settings, lambda kind, payload: self.event_queue.put((kind, payload)))
+        self.relay = SerialNetworkRelay(
+            settings,
+            lambda kind, payload: self.event_queue.put((kind, payload)),
+            inherited_outage_started_at=self._inherited_outage_started_at,
+            application_restart_already_done=self._application_restart_already_done,
+        )
         self.relay.start()
+        self._inherited_outage_started_at = None
+        self._application_restart_already_done = False
 
     def _stop(self) -> None:
         if self.relay is not None:
@@ -2180,6 +2320,8 @@ class SerialRelayApp(tk.Tk):
             remote_port = int(self.remote_port_var.get())
             reconnect_interval = float(self.serial_reconnect_interval_var.get())
             restart_device_after = float(self.serial_restart_after_var.get())
+            restart_application_after = float(self.serial_restart_application_after_var.get())
+            restart_system_after = float(self.serial_restart_system_after_var.get())
             network_reconnect_interval = float(self.network_reconnect_interval_var.get())
         except ValueError as exc:
             raise ValueError("波特率、本地端口、目标端口、重连间隔和超时阈值必须是数字。") from exc
@@ -2188,6 +2330,10 @@ class SerialRelayApp(tk.Tk):
             raise ValueError("串口重连间隔必须大于 0 秒。")
         if restart_device_after <= 0:
             raise ValueError("串口设备重启超时阈值必须大于 0 秒。")
+        if restart_application_after <= 0:
+            raise ValueError("软件重启超时阈值必须大于 0 秒。")
+        if restart_system_after <= 0:
+            raise ValueError("系统重启超时阈值必须大于 0 秒。")
         if network_reconnect_interval <= 0:
             raise ValueError("网络重连间隔必须大于 0 秒。")
 
@@ -2215,6 +2361,10 @@ class SerialRelayApp(tk.Tk):
             reconnect_interval=reconnect_interval,
             restart_device_on_timeout=self.serial_restart_device_var.get(),
             restart_device_after=restart_device_after,
+            restart_application_on_timeout=self.serial_restart_application_var.get(),
+            restart_application_after=restart_application_after,
+            restart_system_on_timeout=self.serial_restart_system_var.get(),
+            restart_system_after=restart_system_after,
         )
 
         access_rules = tuple(split_rules(self.access_text.get("1.0", "end")))
@@ -2265,6 +2415,62 @@ class SerialRelayApp(tk.Tk):
             self.serial_status_var.set(str(payload["text"]))
         elif kind == "notify":
             self._notify(str(payload["title"]), str(payload["message"]))
+        elif kind == "restart_application":
+            self._restart_application(payload)
+        elif kind == "restart_system":
+            self._restart_system()
+
+    def _restart_application(self, payload: dict[str, Any]) -> None:
+        if self._restart_in_progress:
+            return
+        self._restart_in_progress = True
+
+        try:
+            outage_started_at = float(payload.get("outage_started_at", time.time()))
+        except (TypeError, ValueError):
+            outage_started_at = time.time()
+        if outage_started_at <= 0 or outage_started_at > time.time():
+            outage_started_at = time.time()
+
+        self._append_log("WARN", "串口持续离线达到软件重启阈值，正在重新启动本软件。")
+        self._save_settings()
+        command = application_restart_command(
+            parent_pid=os.getpid(),
+            outage_started_at=outage_started_at,
+            start_minimized=self.state() == "withdrawn",
+        )
+        try:
+            subprocess.Popen(
+                command,
+                cwd=app_root(),
+                close_fds=True,
+                creationflags=detached_process_creation_flags(),
+            )
+        except OSError as exc:
+            self._append_log("ERROR", f"自动重启软件失败: {exc}")
+            self._notify("自动重启软件失败", str(exc))
+            self._restart_in_progress = False
+            if self.relay is not None:
+                self.relay.reset_timeout_action("application")
+            return
+
+        self._allow_exit = True
+        self._on_close()
+
+    def _restart_system(self) -> None:
+        self._append_log("WARN", "串口持续离线达到系统重启阈值，正在请求重启 Windows。")
+        self._save_settings()
+        ok, message = schedule_windows_restart(WINDOWS_RESTART_DELAY_SECONDS)
+        if ok:
+            self.status_var.set("等待系统重启")
+            self._append_log("WARN", message)
+            self._notify("Windows 即将重启", message)
+            return
+
+        self._append_log("ERROR", f"自动重启 Windows 失败: {message}")
+        self._notify("自动重启 Windows 失败", message)
+        if self.relay is not None:
+            self.relay.reset_timeout_action("system")
 
     def _handle_traffic(self, payload: dict[str, Any]) -> None:
         message = f"{payload['peer']} {payload['direction']} {payload['byte_count']} B"
@@ -2380,6 +2586,10 @@ class SerialRelayApp(tk.Tk):
             "serial_reconnect_interval": self.serial_reconnect_interval_var.get(),
             "serial_restart_device": self.serial_restart_device_var.get(),
             "serial_restart_after": self.serial_restart_after_var.get(),
+            "serial_restart_application": self.serial_restart_application_var.get(),
+            "serial_restart_application_after": self.serial_restart_application_after_var.get(),
+            "serial_restart_system": self.serial_restart_system_var.get(),
+            "serial_restart_system_after": self.serial_restart_system_after_var.get(),
             "network_mode": self.network_mode_var.get(),
             "bind_host": bind_host_value(self.bind_host_var.get()),
             "local_port": self.local_port_var.get(),
@@ -2423,6 +2633,18 @@ class SerialRelayApp(tk.Tk):
         )
         self.serial_restart_device_var.set(bool(data.get("serial_restart_device", self.serial_restart_device_var.get())))
         self.serial_restart_after_var.set(data.get("serial_restart_after", self.serial_restart_after_var.get()))
+        self.serial_restart_application_var.set(
+            bool(data.get("serial_restart_application", self.serial_restart_application_var.get()))
+        )
+        self.serial_restart_application_after_var.set(
+            data.get("serial_restart_application_after", self.serial_restart_application_after_var.get())
+        )
+        self.serial_restart_system_var.set(
+            bool(data.get("serial_restart_system", self.serial_restart_system_var.get()))
+        )
+        self.serial_restart_system_after_var.set(
+            data.get("serial_restart_system_after", self.serial_restart_system_after_var.get())
+        )
 
         network_mode = data.get("network_mode", self.network_mode_var.get())
         if network_mode not in NETWORK_MODES:
@@ -2540,7 +2762,20 @@ def settings_summary(settings: RelaySettings) -> str:
         if settings.serial.restart_device_on_timeout
         else "重连超时不重启设备"
     )
-    return f"{serial_label}，{network_label}，{client_label}，{access_label}，{reconnect_label}，{restart_label}"
+    application_restart_label = (
+        f"{settings.serial.restart_application_after:g}秒重启软件"
+        if settings.serial.restart_application_on_timeout
+        else "不重启软件"
+    )
+    system_restart_label = (
+        f"{settings.serial.restart_system_after:g}秒重启系统"
+        if settings.serial.restart_system_on_timeout
+        else "不重启系统"
+    )
+    return (
+        f"{serial_label}，{network_label}，{client_label}，{access_label}，{reconnect_label}，"
+        f"{restart_label}，{application_restart_label}，{system_restart_label}"
+    )
 
 
 def is_address_in_use(exc: OSError) -> bool:
@@ -2800,6 +3035,119 @@ def startup_command() -> str:
     return f'"{sys.executable}" "{Path(__file__).resolve()}" --minimized'
 
 
+def application_restart_command(parent_pid: int, outage_started_at: float, start_minimized: bool) -> list[str]:
+    if getattr(sys, "frozen", False):
+        command = [sys.executable]
+    else:
+        command = [sys.executable, str(Path(__file__).resolve())]
+    command.extend(
+        [
+            "--restart-wait-pid",
+            str(parent_pid),
+            "--restart-service",
+            "--serial-outage-started-at",
+            f"{outage_started_at:.6f}",
+            "--serial-software-restart-done",
+        ]
+    )
+    if start_minimized:
+        command.append("--minimized")
+    return command
+
+
+def detached_process_creation_flags() -> int:
+    if os.name != "nt":
+        return 0
+    return getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | getattr(subprocess, "DETACHED_PROCESS", 0)
+
+
+def schedule_windows_restart(delay_seconds: int) -> tuple[bool, str]:
+    if os.name != "nt":
+        return False, "自动重启操作系统仅支持 Windows。"
+
+    delay = max(0, int(delay_seconds))
+    try:
+        result = subprocess.run(
+            [
+                "shutdown.exe",
+                "/r",
+                "/t",
+                str(delay),
+                "/f",
+                "/c",
+                f"{APP_NAME} 检测到串口持续离线，正在执行自动恢复。",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except FileNotFoundError:
+        return False, "未找到 shutdown.exe。"
+    except subprocess.TimeoutExpired:
+        return False, "请求重启 Windows 超时。"
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, str(exc)
+
+    output = "\n".join(part.strip() for part in (result.stdout, result.stderr) if part.strip())
+    if result.returncode in {0, 1190}:
+        return True, f"Windows 已计划在 {delay} 秒后重启。"
+    return False, output or f"shutdown.exe 返回码 {result.returncode}"
+
+
+def parse_runtime_options(argv: list[str]) -> RuntimeOptions:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--minimized", action="store_true")
+    parser.add_argument("--restart-service", action="store_true")
+    parser.add_argument("--restart-wait-pid", type=int)
+    parser.add_argument("--serial-outage-started-at", type=float)
+    parser.add_argument("--serial-software-restart-done", action="store_true")
+    options, _ = parser.parse_known_args(argv)
+    outage_started_at = options.serial_outage_started_at
+    if outage_started_at is not None and outage_started_at <= 0:
+        outage_started_at = None
+    return RuntimeOptions(
+        start_minimized=bool(options.minimized),
+        force_start_service=bool(options.restart_service),
+        restart_wait_pid=options.restart_wait_pid if options.restart_wait_pid and options.restart_wait_pid > 0 else None,
+        inherited_outage_started_at=outage_started_at,
+        application_restart_already_done=bool(options.serial_software_restart_done),
+    )
+
+
+def wait_for_process_exit(pid: int, timeout_seconds: float = 120.0) -> None:
+    if pid <= 0:
+        return
+    if os.name == "nt":
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        open_process = kernel32.OpenProcess
+        open_process.argtypes = (ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32)
+        open_process.restype = ctypes.c_void_p
+        wait_for_single_object = kernel32.WaitForSingleObject
+        wait_for_single_object.argtypes = (ctypes.c_void_p, ctypes.c_uint32)
+        wait_for_single_object.restype = ctypes.c_uint32
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = (ctypes.c_void_p,)
+        close_handle.restype = ctypes.c_int
+
+        handle = open_process(0x00100000, False, pid)
+        if handle:
+            try:
+                wait_for_single_object(handle, max(0, int(timeout_seconds * 1000)))
+            finally:
+                close_handle(handle)
+        time.sleep(0.3)
+        return
+
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            break
+        time.sleep(0.2)
+
+
 def safe_close(resource: object) -> None:
     try:
         close = getattr(resource, "close")
@@ -2835,10 +3183,18 @@ def release_single_instance() -> None:
 
 
 def main() -> int:
+    runtime_options = parse_runtime_options(sys.argv[1:])
+    if runtime_options.restart_wait_pid is not None:
+        wait_for_process_exit(runtime_options.restart_wait_pid)
     if not ensure_single_instance():
         return 0
     try:
-        app = SerialRelayApp(start_minimized="--minimized" in sys.argv)
+        app = SerialRelayApp(
+            start_minimized=runtime_options.start_minimized,
+            force_start_service=runtime_options.force_start_service,
+            inherited_outage_started_at=runtime_options.inherited_outage_started_at,
+            application_restart_already_done=runtime_options.application_restart_already_done,
+        )
         app.mainloop()
     finally:
         release_single_instance()
